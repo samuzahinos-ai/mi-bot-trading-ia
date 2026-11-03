@@ -394,7 +394,7 @@ def maybe_open_position(state, candidates, bot_enabled):
         "entry_total_cost": total_cost,
         "stop_loss": entry_price - stop_distance,
         "take_profit": entry_price + 2.5 * stop_distance,
-        "max_price": chosen["high"],
+        "max_price": entry_price,
         "last_price": chosen["price"],
         "last_candle_ts": chosen["timestamp"],
         "opened_at": utc_now(),
