@@ -1,509 +1,661 @@
-import ccxt
-import time
-import math
 import json
+import math
 import os
+import sqlite3
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
+
+import ccxt
 import streamlit as st
-from google import genai
 
-# =====================================================================
-# 1. CONFIGURACIÓN INSTITUCIONAL Y CLAVE API INTEGRADA
-# =====================================================================
-GEMINI_API_KEY_DIRECTA = ""
+# Gemini solo redacta un comentario opcional. Nunca decide ni autoriza operaciones.
+try:
+    from google import genai
+except Exception:
+    genai = None
 
-MONEDAS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT']
-TIMEFRAME = '1m'
-COMISION = 0.001              # 0.1% comisión real
-RIESGO_POR_TRADE = 0.98       # Invierte el 98% del saldo en la mejor oportunidad
-UMBRAL_PRE_COMPRA = 50        # Puntuación para activar el comité de IA
-UMBRAL_COMPRA_FINAL = 65      # Puntuación mínima (de 100) para ejecutar compra
-ARCHIVO_ESTADO = 'estado_bot_pro.json'
+st.set_page_config(page_title="Bot de trading | Simulación", page_icon="📊", layout="wide")
 
-def obtener_api_key():
+# ----------------------------- CONFIGURACIÓN -----------------------------
+PAIRS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"]
+TIMEFRAME = "1m"
+CANDLE_LIMIT = 700
+INITIAL_BALANCE = 1000.0
+FEE_RATE = 0.001              # 0,10 % por lado; supuesto configurable
+SLIPPAGE_RATE = 0.0005        # 0,05 % por lado; supuesto de simulación
+RISK_PER_TRADE = 0.01         # Riesgo teórico del 1 % del patrimonio hasta el stop
+MAX_ALLOCATION = 0.25         # Máximo 25 % del efectivo en una posición
+MAX_DAILY_LOSS = 0.03         # Bloquea nuevas entradas al perder 3 % en el día
+MIN_SCORE = 70
+DB_PATH = os.environ.get("PAPER_DB_PATH", "paper_trading.sqlite3")
+MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def default_state():
+    return {
+        "cash": INITIAL_BALANCE,
+        "initial_balance": INITIAL_BALANCE,
+        "position": None,
+        "trades": [],
+        "realized_pnl": 0.0,
+        "wins": 0,
+        "losses": 0,
+        "peak_equity": INITIAL_BALANCE,
+        "max_drawdown_pct": 0.0,
+        "day": datetime.now(timezone.utc).date().isoformat(),
+        "day_start_equity": INITIAL_BALANCE,
+        "daily_realized_pnl": 0.0,
+        "last_scan": None,
+        "last_error": None,
+        "last_comment": "Esperando el primer escaneo.",
+        "radar": {},
+    }
+
+
+def db_connection():
+    con = sqlite3.connect(DB_PATH, timeout=20)
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS bot_state (id INTEGER PRIMARY KEY CHECK (id = 1), payload TEXT NOT NULL)"
+    )
+    con.commit()
+    return con
+
+
+def load_state():
+    con = db_connection()
     try:
-        if "GEMINI_API_KEY" in st.secrets:
-            return st.secrets["GEMINI_API_KEY"].strip()
-    except Exception:
-        pass
-    return os.environ.get("GEMINI_API_KEY", GEMINI_API_KEY_DIRECTA).strip()
+        row = con.execute("SELECT payload FROM bot_state WHERE id = 1").fetchone()
+        if row is None:
+            state = default_state()
+            con.execute(
+                "INSERT INTO bot_state (id, payload) VALUES (1, ?)",
+                (json.dumps(state),),
+            )
+            con.commit()
+            return state
+        state = default_state()
+        state.update(json.loads(row[0]))
+        return state
+    finally:
+        con.close()
 
-def conectar_exchange():
-    for nombre in ['kraken', 'bybit', 'coinbase', 'binance']:
-        try:
-            ex = getattr(ccxt, nombre)({'enableRateLimit': True})
-            ex.fetch_ohlcv('BTC/USDT', timeframe=TIMEFRAME, limit=5)
-            return ex, nombre.upper()
-        except Exception:
-            continue
-    return ccxt.kraken({'enableRateLimit': True}), "KRAKEN"
 
-# =====================================================================
-# 2. SUITE MATEMÁTICA DE 7 INDICADORES + LIBRO DE ÓRDENES (BALLENAS)
-# =====================================================================
-def calcular_ema(precios, periodo):
-    k = 2.0 / (periodo + 1)
-    ema = [sum(precios[:periodo]) / periodo]
-    for p in precios[periodo:]:
-        ema.append(p * k + ema[-1] * (1.0 - k))
-    return ema
-
-def calcular_rsi_wilder(precios, periodo=14):
-    deltas = [precios[i] - precios[i - 1] for i in range(1, len(precios))]
-    ganancias = [max(d, 0.0) for d in deltas]
-    perdidas = [max(-d, 0.0) for d in deltas]
-    avg_gain = sum(ganancias[:periodo]) / periodo
-    avg_loss = sum(perdidas[:periodo]) / periodo
-    for i in range(periodo, len(deltas)):
-        avg_gain = (avg_gain * (periodo - 1) + ganancias[i]) / periodo
-        avg_loss = (avg_loss * (periodo - 1) + perdidas[i]) / periodo
-    return 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
-
-def calcular_stoch_rsi(precios, periodo=14):
-    rsis = [calcular_rsi_wilder(precios[:i], periodo) for i in range(periodo + 15, len(precios) + 1)]
-    if len(rsis) < periodo:
-        return 50.0
-    ventana = rsis[-periodo:]
-    min_r, max_r = min(ventana), max(ventana)
-    return 50.0 if max_r == min_r else ((rsis[-1] - min_r) / (max_r - min_r)) * 100.0
-
-def calcular_bollinger(precios, periodo=20, mult=2.0):
-    ventana = precios[-periodo:]
-    sma = sum(ventana) / periodo
-    std = math.sqrt(sum((x - sma) ** 2 for x in ventana) / periodo)
-    return sma - mult * std, sma, sma + mult * std
-
-def calcular_macd(precios):
-    ema12 = calcular_ema(precios, 12)
-    ema26 = calcular_ema(precios, 26)
-    n = len(ema26)
-    linea = [ema12[-n + i] - ema26[i] for i in range(n)]
-    senal = calcular_ema(linea, 9)
-    return linea[-1] - senal[-1], linea[-2] - senal[-2]
-
-def calcular_atr(velas, periodo=14):
-    trs = [
-        max(velas[i][2] - velas[i][3], abs(velas[i][2] - velas[i - 1][4]), abs(velas[i][3] - velas[i - 1][4]))
-        for i in range(1, len(velas))
-    ]
-    return sum(trs[-periodo:]) / periodo
-
-def calcular_vwap(velas, periodo=50):
-    recientes = velas[-periodo:]
-    vol_total = sum(v[5] for v in recientes)
-    if vol_total == 0:
-        return recientes[-1][4]
-    suma_pv = sum(((v[2] + v[3] + v[4]) / 3.0) * v[5] for v in recientes)
-    return suma_pv / vol_total
-
-def analizar_presion_ballenas(exchange, symbol):
+def save_state(state):
+    con = db_connection()
     try:
-        ob = exchange.fetch_order_book(symbol, limit=15)
-        vol_compras = sum(bid[1] for bid in ob['bids'][:15])
-        vol_ventas = sum(ask[1] for ask in ob['asks'][:15])
-        total = vol_compras + vol_ventas
-        return (vol_compras / total) * 100.0 if total > 0 else 50.0
-    except Exception:
-        return 50.0
-
-# =====================================================================
-# 3. DOBLE MOTOR DE IA (GEMINI + ANALISTA NEURONAL LOCAL DE RESPALDO)
-# =====================================================================
-def motor_ia_local_heuristico(info, ultimas_velas):
-    # Analiza microestructura de velas (absorción de mechas e impulso) si la API externa falla
-    v = ultimas_velas[-1]
-    apertura, maximo, minimo, cierre = v[1], v[2], v[3], v[4]
-    rango = max(maximo - minimo, cierre * 0.0001)
-    mecha_inf = (min(apertura, cierre) - minimo) / rango
-    mecha_sup = (maximo - max(apertura, cierre)) / rango
-
-    ajuste = 0
-    notas = []
-    if mecha_inf > 0.45:
-        ajuste += 8
-        notas.append("fuerte absorción compradora en mecha inferior")
-    if info["presion_compras"] > 58:
-        ajuste += 7
-        notas.append(f"dominio de ballenas ({info['presion_compras']:.0f}% bids)")
-    elif info["presion_compras"] < 42:
-        ajuste -= 8
-        notas.append("muro de ventas en Order Book")
-    if mecha_sup > 0.55:
-        ajuste -= 6
-        notas.append("rechazo en parte alta")
-    if info["stoch_rsi"] < 20:
-        ajuste += 5
-        notas.append("StochRSI en suelo óptimo")
-
-    resumen = ", ".join(notas) if notas else "estructura de mercado equilibrada"
-    return max(-20, min(20, ajuste)), f"[IA Cuantitativa Activa] {resumen.capitalize()}"
-
-def consultar_comite_ia(ia_client, symbol, info, ultimas_velas):
-    if ia_client:
-        resumen = [f"O:{v[1]:.2f} H:{v[2]:.2f} L:{v[3]:.2f} C:{v[4]:.2f}" for v in ultimas_velas[-4:]]
-        prompt = (
-            f"Actúa como director cuantitativo. Analiza {symbol} (1m): "
-            f"Precio ${info['precio']:.4f}, Régimen {info['regimen']}, RSI {info['rsi']:.1f}, "
-            f"StochRSI {info['stoch_rsi']:.1f}, Presión Libro Órdenes {info['presion_compras']:.1f}%, "
-            f"Score {info['score']}/100 ({info['razones']}). Velas: {'|'.join(resumen)}. "
-            f'Responde SOLO JSON válido: {{"ajuste_puntos": <entero -20 a 20>, "analisis": "<máximo 12 palabras>"}}'
+        con.execute(
+            "INSERT INTO bot_state (id, payload) VALUES (1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET payload = excluded.payload",
+            (json.dumps(state),),
         )
-        for modelo in ['gemini-2.0-flash', 'gemini-2.5-flash', 'gemini-1.5-flash']:
-            try:
-                resp = ia_client.models.generate_content(model=modelo, contents=prompt)
-                texto = resp.text.strip()
-                ini, fin = texto.find('{'), texto.rfind('}')
-                if ini != -1 and fin != -1:
-                    datos = json.loads(texto[ini:fin + 1])
-                    ajuste = max(-20, min(20, int(datos.get("ajuste_puntos", 0))))
-                    return ajuste, f"[Gemini IA] {datos.get('analisis', 'Análisis completado')}"
-            except Exception:
-                continue
-    # Si la API Key devuelve 404 o límite de cuota, usa el motor neuronal local sin interrumpir
-    return motor_ia_local_heuristico(info, ultimas_velas)
+        con.commit()
+    finally:
+        con.close()
 
-# =====================================================================
-# 4. EVALUADOR MULTIFACTORIAL DE MERCADO (0 A 100 PUNTOS)
-# =====================================================================
-def evaluar_par(exchange, symbol, velas):
-    cierres = [v[4] for v in velas]
-    volumenes = [v[5] for v in velas]
-    precio = cierres[-1]
 
-    ema50 = calcular_ema(cierres, 50)[-1]
-    ema200 = calcular_ema(cierres, 200)[-1]
-    rsi = calcular_rsi_wilder(cierres, 14)
-    stoch_rsi = calcular_stoch_rsi(cierres, 14)
-    bb_inf, bb_med, bb_sup = calcular_bollinger(cierres, 20, 2.0)
-    hist_act, hist_prev = calcular_macd(cierres)
-    atr = calcular_atr(velas, 14)
-    vwap = calcular_vwap(velas, 50)
-    presion_compras = analizar_presion_ballenas(exchange, symbol)
+def reset_state():
+    con = db_connection()
+    try:
+        con.execute("DELETE FROM bot_state WHERE id = 1")
+        con.commit()
+    finally:
+        con.close()
 
-    vol_medio = sum(volumenes[-21:-1]) / 20
-    vol_ratio = volumenes[-1] / vol_medio if vol_medio > 0 else 1.0
 
-    if precio > ema50 > ema200:
-        regimen = "ALCISTA"
-    elif precio < ema200 and (ema200 - precio) / ema200 > 0.008:
-        regimen = "DESPLOME"
+@st.cache_resource
+def get_runtime():
+    exchange_id = os.environ.get("EXCHANGE_ID", "kraken").lower()
+    if exchange_id not in {"kraken", "binance", "bybit", "coinbase"}:
+        raise ValueError("EXCHANGE_ID no válido. Usa kraken, binance, bybit o coinbase.")
+    exchange_class = getattr(ccxt, exchange_id)
+    exchange = exchange_class({
+        "enableRateLimit": True,
+        "timeout": 15000,
+        "options": {"defaultType": "spot"},
+    })
+    exchange.load_markets()
+    available = [symbol for symbol in PAIRS if symbol in exchange.markets]
+    return exchange, exchange_id.upper(), available, threading.Lock()
+
+
+# ----------------------------- INDICADORES -----------------------------
+def ema_series(values, period):
+    if len(values) < period:
+        raise ValueError("No hay suficientes datos para calcular EMA.")
+    k = 2.0 / (period + 1.0)
+    current = sum(values[:period]) / period
+    result = [None] * (period - 1) + [current]
+    for value in values[period:]:
+        current = value * k + current * (1.0 - k)
+        result.append(current)
+    return result
+
+
+def rsi_series(closes, period=14):
+    if len(closes) <= period:
+        raise ValueError("No hay suficientes datos para RSI.")
+    changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [max(change, 0.0) for change in changes]
+    losses = [max(-change, 0.0) for change in changes]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    result = [None] * period
+    result.append(100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss))
+    for i in range(period, len(changes)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        result.append(100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss))
+    return result
+
+
+def macd_histogram(closes):
+    fast = ema_series(closes, 12)
+    slow = ema_series(closes, 26)
+    start = 25
+    macd = [fast[i] - slow[i] for i in range(start, len(closes))]
+    signal = ema_series(macd, 9)
+    return macd[-1] - signal[-1], macd[-2] - signal[-2]
+
+
+def atr_value(candles, period=14):
+    true_ranges = []
+    for i in range(1, len(candles)):
+        high, low, previous_close = candles[i][2], candles[i][3], candles[i - 1][4]
+        true_ranges.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
+    return sum(true_ranges[-period:]) / period
+
+
+def rolling_vwap(candles, period=50):
+    recent = candles[-period:]
+    volume = sum(row[5] for row in recent)
+    if volume <= 0:
+        return recent[-1][4]
+    return sum(((row[2] + row[3] + row[4]) / 3.0) * row[5] for row in recent) / volume
+
+
+def order_book_pressure(exchange, symbol):
+    try:
+        book = exchange.fetch_order_book(symbol, limit=15)
+        bid_value = sum(price * amount for price, amount in book.get("bids", [])[:15])
+        ask_value = sum(price * amount for price, amount in book.get("asks", [])[:15])
+        total = bid_value + ask_value
+        return 100.0 * bid_value / total if total > 0 else 50.0
+    except Exception:
+        return 50.0
+
+
+def evaluate_pair(exchange, symbol, candles):
+    if len(candles) < 230:
+        raise ValueError("Se requieren al menos 230 velas cerradas.")
+    closes = [row[4] for row in candles]
+    volumes = [row[5] for row in candles]
+    price = closes[-1]
+
+    ema50 = ema_series(closes, 50)[-1]
+    ema200 = ema_series(closes, 200)[-1]
+    rsi_values = rsi_series(closes, 14)
+    rsi = rsi_values[-1]
+    valid_rsi = [value for value in rsi_values[-14:] if value is not None]
+    stoch = 50.0
+    if valid_rsi and max(valid_rsi) != min(valid_rsi):
+        stoch = 100.0 * (valid_rsi[-1] - min(valid_rsi)) / (max(valid_rsi) - min(valid_rsi))
+
+    macd_now, macd_previous = macd_histogram(closes)
+    atr = atr_value(candles, 14)
+    vwap = rolling_vwap(candles, 50)
+    pressure = order_book_pressure(exchange, symbol)
+    average_volume = sum(volumes[-21:-1]) / 20.0
+    volume_ratio = volumes[-1] / average_volume if average_volume > 0 else 1.0
+
+    if price > ema50 > ema200:
+        regime = "ALCISTA"
+    elif price < ema200 and (ema200 - price) / ema200 > 0.008:
+        regime = "BAJISTA FUERTE"
     else:
-        regimen = "LATERAL"
+        regime = "LATERAL"
 
-    score, razones = 0, []
-
-    # 1. RSI + StochRSI (hasta 30 pts)
-    if rsi < 32:
-        score += 22; razones.append(f"RSI sobrevendido ({rsi:.0f})")
-    elif rsi < 42:
-        score += 14; razones.append(f"RSI bajo ({rsi:.0f})")
-    elif rsi < 50 and regimen == "ALCISTA":
-        score += 10; razones.append("Pullback RSI")
-
-    if stoch_rsi < 20:
-        score += 8; razones.append("StochRSI suelo")
-
-    # 2. Bandas de Bollinger + VWAP (hasta 25 pts)
-    dist_bb = (precio - bb_inf) / (bb_sup - bb_inf) if (bb_sup - bb_inf) > 0 else 0.5
-    if precio <= bb_inf:
-        score += 20; razones.append("Toque Banda Inf BB")
-    elif dist_bb < 0.28:
-        score += 12; razones.append("Zona baja BB")
-
-    if precio < vwap and regimen != "DESPLOME":
-        score += 5; razones.append("Descuento bajo VWAP")
-
-    # 3. MACD Impulso (hasta 15 pts)
-    if hist_act > hist_prev and hist_act < 0:
-        score += 15; razones.append("Giro MACD alcista")
-    elif hist_act > 0 and hist_act > hist_prev:
-        score += 10; razones.append("Impulso MACD")
-
-    # 4. Libro de Órdenes / Ballenas (hasta 15 pts)
-    if presion_compras >= 60:
-        score += 15; razones.append(f"Ballenas comprando ({presion_compras:.0f}%)")
-    elif presion_compras >= 54:
-        score += 8; razones.append(f"Libro positivo ({presion_compras:.0f}%)")
-    elif presion_compras < 40:
-        score -= 10; razones.append("Presión vendedora")
-
-    # 5. Tendencia EMA y Volumen (hasta 15 pts)
-    if regimen == "ALCISTA":
-        score += 10; razones.append("Tendencia EMA")
-    elif regimen == "LATERAL":
-        score += 4
-    elif regimen == "DESPLOME":
-        score -= 30; razones.append("Alerta desplome")
-
-    if vol_ratio > 1.3:
-        score += 5; razones.append(f"Vol {vol_ratio:.1f}x")
+    score = 0
+    reasons = []
+    if price > ema50 > ema200:
+        score += 25
+        reasons.append("tendencia EMA alcista")
+    if 38 <= rsi <= 62:
+        score += 15
+        reasons.append("RSI en zona moderada")
+    elif 30 <= rsi < 38 and regime == "ALCISTA":
+        score += 10
+        reasons.append("posible retroceso en tendencia")
+    if macd_now > macd_previous and macd_now > 0:
+        score += 20
+        reasons.append("impulso MACD positivo")
+    elif macd_now > macd_previous:
+        score += 10
+        reasons.append("MACD mejorando")
+    if price > vwap:
+        score += 10
+        reasons.append("precio sobre VWAP móvil")
+    if volume_ratio >= 1.2:
+        score += 10
+        reasons.append("volumen superior a la media")
+    if pressure >= 55:
+        score += 10
+        reasons.append("libro inclinado a compras")
+    if atr > 0 and atr / price < 0.02:
+        score += 10
+        reasons.append("volatilidad dentro del límite")
+    if rsi > 72:
+        score -= 15
+        reasons.append("RSI elevado")
+    if regime == "BAJISTA FUERTE":
+        score -= 25
+        reasons.append("tendencia bajista fuerte")
 
     return {
-        "symbol": symbol, "precio": precio, "rsi": round(rsi, 1),
-        "stoch_rsi": round(stoch_rsi, 1), "atr": atr, "vwap": vwap,
-        "presion_compras": round(presion_compras, 1), "regimen": regimen,
+        "symbol": symbol,
+        "timestamp": int(candles[-1][0]),
+        "price": price,
+        "open": candles[-1][1],
+        "high": candles[-1][2],
+        "low": candles[-1][3],
+        "rsi": round(rsi, 1),
+        "stoch_rsi": round(stoch, 1),
+        "atr": atr,
+        "vwap": vwap,
+        "buy_pressure": round(pressure, 1),
+        "volume_ratio": round(volume_ratio, 2),
+        "regime": regime,
         "score": max(0, min(100, score)),
-        "razones": ", ".join(razones) if razones else "Mercado en equilibrio"
+        "reasons": ", ".join(reasons) if reasons else "sin señal clara",
     }
 
-# =====================================================================
-# 5. MOTOR 24/7 EN SEGUNDO PLANO CON GESTIÓN DE RIESGO AVANZADA
-# =====================================================================
-@st.cache_resource
-def iniciar_terminal_24_7():
-    exchange, nombre_ex = conectar_exchange()
-    api_key = obtener_api_key()
-    ia_client = genai.Client(api_key=api_key) if api_key else None
 
-    estado = {
-        "usdt": 1000.0, "moneda_activa": None, "cantidad_cripto": 0.0,
-        "precio_entrada": 0.0, "precio_actual_activa": 0.0,
-        "stop_loss": 0.0, "take_profit": 0.0, "max_precio": 0.0,
-        "break_even_activo": False, "ganadas": 0, "perdidas": 0,
-        "ganancia_acumulada": 0.0, "perdida_acumulada": 0.0,
-        "max_cartera": 1000.0, "max_drawdown": 0.0,
-        "ultimo_comentario_ia": "Escáner Multi-Cripto e IA inicializados",
-        "ultima_actualizacion": "-", "exchange": nombre_ex,
-        "radar": {}, "historial": []
+# -------------------------- SIMULADOR DE ÓRDENES -------------------------
+def current_equity(state, prices=None):
+    prices = prices or {}
+    position = state.get("position")
+    if not position:
+        return float(state["cash"])
+    mark = prices.get(position["symbol"], position["last_price"])
+    # Valoración neta estimada: descuenta comisión de una hipotética salida.
+    return float(state["cash"]) + position["quantity"] * mark * (1.0 - FEE_RATE)
+
+
+def close_position(state, exit_price, reason, candle_time):
+    pos = state["position"]
+    proceeds = pos["quantity"] * exit_price * (1.0 - FEE_RATE)
+    pnl = proceeds - pos["entry_total_cost"]
+    state["cash"] += proceeds
+    state["realized_pnl"] += pnl
+    state["daily_realized_pnl"] += pnl
+    if pnl >= 0:
+        state["wins"] += 1
+    else:
+        state["losses"] += 1
+    state["trades"].insert(0, {
+        "time": utc_now(),
+        "symbol": pos["symbol"],
+        "side": "VENTA",
+        "price": round(exit_price, 8),
+        "quantity": round(pos["quantity"], 8),
+        "pnl": round(pnl, 4),
+        "reason": reason,
+        "candle_time": candle_time,
+    })
+    state["trades"] = state["trades"][:200]
+    state["last_comment"] = f"Cierre simulado {pos['symbol']}: {reason}. PnL neto {pnl:+.2f} USDT."
+    state["position"] = None
+
+
+def manage_open_position(state, info):
+    pos = state.get("position")
+    if not pos or info["symbol"] != pos["symbol"]:
+        return
+    if info["timestamp"] <= pos.get("last_candle_ts", 0):
+        return
+
+    stop = pos["stop_loss"]
+    target = pos["take_profit"]
+    low, high, opening, close = info["low"], info["high"], info["open"], info["price"]
+
+    # Si en una misma vela se tocaron stop y objetivo, se supone que saltó primero el stop.
+    stop_hit = low <= stop
+    target_hit = high >= target
+    if stop_hit:
+        raw_exit = min(opening, stop)
+        exit_price = raw_exit * (1.0 - SLIPPAGE_RATE)
+        reason = "stop loss (prioridad conservadora intravela)"
+        close_position(state, exit_price, reason, info["timestamp"])
+        return
+    if target_hit:
+        exit_price = target * (1.0 - SLIPPAGE_RATE)
+        close_position(state, exit_price, "take profit", info["timestamp"])
+        return
+
+    if info["rsi"] >= 78 and close > pos["entry_price"]:
+        exit_price = close * (1.0 - SLIPPAGE_RATE)
+        close_position(state, exit_price, "salida por RSI extremo", info["timestamp"])
+        return
+
+    pos["last_price"] = close
+    pos["last_candle_ts"] = info["timestamp"]
+    pos["max_price"] = max(pos["max_price"], high)
+    # Break-even solo cuando la subida cubre aproximadamente comisiones y deslizamiento.
+    fee_buffer = 2.0 * FEE_RATE + 2.0 * SLIPPAGE_RATE
+    if pos["max_price"] >= pos["entry_price"] * (1.0 + fee_buffer + 0.003):
+        pos["stop_loss"] = max(pos["stop_loss"], pos["entry_price"] * (1.0 + fee_buffer))
+    trailing = pos["max_price"] - 1.8 * max(info["atr"], close * 0.001)
+    pos["stop_loss"] = max(pos["stop_loss"], trailing)
+
+
+def maybe_open_position(state, candidates, bot_enabled):
+    if not bot_enabled or state.get("position") is not None or not candidates:
+        return
+    today_equity = current_equity(state, {x["symbol"]: x["price"] for x in candidates})
+    daily_floor = state["day_start_equity"] * (1.0 - MAX_DAILY_LOSS)
+    if today_equity <= daily_floor or state["daily_realized_pnl"] <= -MAX_DAILY_LOSS * state["day_start_equity"]:
+        state["last_comment"] = "Límite diario de pérdida alcanzado: nuevas entradas bloqueadas."
+        return
+
+    candidates = sorted(candidates, key=lambda item: item["score"], reverse=True)
+    chosen = candidates[0]
+    if chosen["score"] < MIN_SCORE or chosen["regime"] != "ALCISTA" or chosen["atr"] <= 0:
+        state["last_comment"] = (
+            f"Sin entrada: mejor señal {chosen['symbol']} con {chosen['score']}/100; "
+            "se exige tendencia alcista y puntuación mínima."
+        )
+        return
+
+    if state.get("last_entry_candle") == chosen["timestamp"]:
+        return
+
+    equity = today_equity
+    entry_price = chosen["price"] * (1.0 + SLIPPAGE_RATE)
+    stop_distance = 1.5 * chosen["atr"]
+    risk_budget = equity * RISK_PER_TRADE
+    quantity_by_risk = risk_budget / stop_distance
+    max_spend = state["cash"] * MAX_ALLOCATION
+    quantity_by_allocation = max_spend / (entry_price * (1.0 + FEE_RATE))
+    quantity = min(quantity_by_risk, quantity_by_allocation)
+    total_cost = quantity * entry_price * (1.0 + FEE_RATE)
+
+    if quantity <= 0 or total_cost <= 0 or total_cost > state["cash"]:
+        state["last_comment"] = "Entrada omitida: tamaño de posición no válido."
+        return
+
+    state["cash"] -= total_cost
+    state["position"] = {
+        "symbol": chosen["symbol"],
+        "quantity": quantity,
+        "entry_price": entry_price,
+        "entry_total_cost": total_cost,
+        "stop_loss": entry_price - stop_distance,
+        "take_profit": entry_price + 2.5 * stop_distance,
+        "max_price": entry_price,
+        "last_price": chosen["price"],
+        "last_candle_ts": chosen["timestamp"],
+        "opened_at": utc_now(),
     }
+    state["last_entry_candle"] = chosen["timestamp"]
+    state["trades"].insert(0, {
+        "time": utc_now(),
+        "symbol": chosen["symbol"],
+        "side": "COMPRA",
+        "price": round(entry_price, 8),
+        "quantity": round(quantity, 8),
+        "pnl": None,
+        "reason": f"score {chosen['score']}/100: {chosen['reasons']}",
+        "candle_time": chosen["timestamp"],
+    })
+    state["trades"] = state["trades"][:200]
+    state["last_comment"] = f"Compra simulada {chosen['symbol']}; score {chosen['score']}/100."
 
-    if os.path.exists(ARCHIVO_ESTADO):
+
+def run_cycle(exchange, symbols, state, bot_enabled):
+    now_day = datetime.now(timezone.utc).date().isoformat()
+    if state.get("day") != now_day:
+        state["day"] = now_day
+        state["day_start_equity"] = current_equity(state)
+        state["daily_realized_pnl"] = 0.0
+
+    radar = {}
+    candle_data = {}
+    errors = []
+    for symbol in symbols:
         try:
-            with open(ARCHIVO_ESTADO, 'r', encoding='utf-8') as f:
-                guardado = json.load(f)
-                estado.update(guardado)
-        except Exception:
-            pass
+            raw = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
+            # La última vela suele estar abierta. No se usa para indicadores ni decisiones.
+            closed = raw[:-1]
+            if len(closed) < 230:
+                raise ValueError("histórico insuficiente")
+            info = evaluate_pair(exchange, symbol, closed)
+            radar[symbol] = info
+            candle_data[symbol] = closed[-1]
+        except Exception as exc:
+            errors.append(f"{symbol}: {str(exc)[:100]}")
 
-    def bucle_operativo():
-        while True:
-            try:
-                ahora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                mejor_candidata = None
-                mejor_velas = None
+    state["radar"] = radar
+    if state.get("position"):
+        active_symbol = state["position"]["symbol"]
+        active_info = radar.get(active_symbol)
+        if active_info:
+            manage_open_position(state, active_info)
 
-                # 1. Escanear las 5 criptomonedas en tiempo real
-                for sym in MONEDAS:
-                    try:
-                        velas = exchange.fetch_ohlcv(sym, timeframe=TIMEFRAME, limit=210)
-                        info = evaluar_par(exchange, sym, velas)
-                        estado["radar"][sym] = info
-                        if sym == estado["moneda_activa"]:
-                            estado["precio_actual_activa"] = info["precio"]
-                        if mejor_candidata is None or info["score"] > mejor_candidata["score"]:
-                            mejor_candidata = info
-                            mejor_velas = velas
-                    except Exception:
-                        continue
+    if state.get("position") is None:
+        maybe_open_position(state, list(radar.values()), bot_enabled)
 
-                # 2. Si NO hay posición abierta, evaluar compra en la mejor moneda del radar
-                if estado["moneda_activa"] is None and mejor_candidata:
-                    score_final = mejor_candidata["score"]
-                    if score_final >= UMBRAL_PRE_COMPRA:
-                        ajuste, comentario = consultar_comite_ia(ia_client, mejor_candidata["symbol"], mejor_candidata, mejor_velas)
-                        score_final = max(0, min(100, score_final + ajuste))
-                        mejor_candidata["score"] = score_final
-                        estado["radar"][mejor_candidata["symbol"]]["score"] = score_final
-                        estado["ultimo_comentario_ia"] = f"{mejor_candidata['symbol']} ({ajuste:+d} pts): {comentario}"
-                    else:
-                        estado["ultimo_comentario_ia"] = (
-                            f"Mejor par: {mejor_candidata['symbol']} (Score {score_final}/100) — "
-                            f"{mejor_candidata['razones']}"
-                        )
+    prices = {symbol: item["price"] for symbol, item in radar.items()}
+    equity = current_equity(state, prices)
+    state["peak_equity"] = max(state.get("peak_equity", INITIAL_BALANCE), equity)
+    if state["peak_equity"] > 0:
+        drawdown = 100.0 * (state["peak_equity"] - equity) / state["peak_equity"]
+        state["max_drawdown_pct"] = max(state.get("max_drawdown_pct", 0.0), drawdown)
+    state["last_scan"] = utc_now()
+    state["last_error"] = " | ".join(errors) if errors else None
+    if not radar and errors:
+        state["last_comment"] = "No se recibieron datos válidos. Revisa el exchange y sus mercados."
+    save_state(state)
+    return state
 
-                    if score_final >= UMBRAL_COMPRA_FINAL:
-                        sym = mejor_candidata["symbol"]
-                        precio = mejor_candidata["precio"]
-                        atr = max(mejor_candidata["atr"], precio * 0.0018)
-                        inv = estado["usdt"] * RIESGO_POR_TRADE
 
-                        estado["cantidad_cripto"] = (inv / precio) * (1.0 - COMISION)
-                        estado["usdt"] -= inv
-                        estado["moneda_activa"] = sym
-                        estado["precio_entrada"] = precio
-                        estado["precio_actual_activa"] = precio
-                        estado["max_precio"] = precio
-                        estado["stop_loss"] = precio - (1.8 * atr)
-                        estado["take_profit"] = precio + (3.2 * atr)
-                        estado["break_even_activo"] = False
+# ------------------------------- INTERFAZ --------------------------------
+st.title("📊 Bot de trading con simulación")
+st.caption("Solo datos públicos y operaciones ficticias. No se envían órdenes al exchange.")
 
-                        estado["historial"].insert(
-                            0, f"[{ahora}] COMPRA {sym} a ${precio:.4f} | Score: {score_final}/100 | {mejor_candidata['razones']}"
-                        )
+with st.sidebar:
+    st.header("Control")
+    bot_enabled = st.toggle("Permitir nuevas entradas simuladas", value=True)
+    st.caption("Al desactivarlo, se bloquean nuevas compras; la posición abierta sigue gestionándose.")
+    st.divider()
+    st.write("**Supuestos del simulador**")
+    st.write(f"Comisión: {FEE_RATE * 100:.2f} % por lado")
+    st.write(f"Deslizamiento: {SLIPPAGE_RATE * 100:.2f} % por lado")
+    st.write(f"Riesgo teórico por operación: {RISK_PER_TRADE * 100:.1f} %")
+    st.write(f"Máxima asignación: {MAX_ALLOCATION * 100:.0f} % del efectivo")
+    st.write(f"Pérdida diaria máxima: {MAX_DAILY_LOSS * 100:.0f} %")
 
-                # 3. Si HAY posición abierta, gestionar Break-Even, Trailing Stop y Venta
-                elif estado["moneda_activa"] is not None:
-                    sym = estado["moneda_activa"]
-                    info_act = estado["radar"].get(sym)
-                    if info_act:
-                        precio = info_act["precio"]
-                        estado["precio_actual_activa"] = precio
-                        atr = max(info_act["atr"], precio * 0.0018)
-                        cambio_pct = ((precio - estado["precio_entrada"]) / estado["precio_entrada"]) * 100.0
+try:
+    exchange, exchange_name, available_symbols, cycle_lock = get_runtime()
+except Exception as exc:
+    st.error(f"No se pudo inicializar el exchange: {exc}")
+    st.stop()
 
-                        # Escudo Break-Even: si gana +0.35%, asegura no perder dinero
-                        if not estado["break_even_activo"] and cambio_pct >= 0.35:
-                            estado["stop_loss"] = max(estado["stop_loss"], estado["precio_entrada"] * 1.0015)
-                            estado["break_even_activo"] = True
+if not available_symbols:
+    st.error(
+        f"{exchange_name} no anuncia ninguno de los pares configurados ({', '.join(PAIRS)}). "
+        "Cambia EXCHANGE_ID en la configuración."
+    )
+    st.stop()
 
-                        # Trailing Stop dinámico
-                        if precio > estado["max_precio"]:
-                            estado["max_precio"] = precio
-                            nuevo_sl = precio - (1.4 * atr)
-                            if nuevo_sl > estado["stop_loss"]:
-                                estado["stop_loss"] = nuevo_sl
+missing = sorted(set(PAIRS) - set(available_symbols))
+if missing:
+    st.warning(f"Pares no disponibles en {exchange_name}: {', '.join(missing)}. Se omiten.")
 
-                        motivo = None
-                        if precio <= estado["stop_loss"]:
-                            motivo = "Trailing Stop / Break-Even" if estado["break_even_activo"] else "Stop Loss de protección"
-                        elif precio >= estado["take_profit"]:
-                            motivo = "Take Profit alcanzado"
-                        elif info_act["rsi"] > 76 and cambio_pct > 0.40:
-                            motivo = f"Toma de ganancias por RSI extremo ({info_act['rsi']})"
+st.info(
+    f"Fuente de precios: {exchange_name} | Marco temporal: {TIMEFRAME} | "
+    f"Activos analizados: {', '.join(available_symbols)}"
+)
 
-                        if motivo:
-                            recuperado = (estado["cantidad_cripto"] * precio) * (1.0 - COMISION)
-                            costo_original = estado["cantidad_cripto"] * estado["precio_entrada"]
-                            pnl = recuperado - costo_original
 
-                            if pnl >= 0:
-                                estado["ganadas"] += 1
-                                estado["ganancia_acumulada"] += pnl
-                            else:
-                                estado["perdidas"] += 1
-                                estado["perdida_acumulada"] += abs(pnl)
+@st.fragment(run_every="30s")
+def live_panel():
+    if cycle_lock.acquire(blocking=False):
+        try:
+            state = load_state()
+            state = run_cycle(exchange, available_symbols, state, bot_enabled)
+        except Exception as exc:
+            st.error(f"Error durante el ciclo: {exc}")
+            state = load_state()
+            state["last_error"] = str(exc)[:250]
+            save_state(state)
+        finally:
+            cycle_lock.release()
+    else:
+        state = load_state()
+        st.caption("Hay otro ciclo de análisis en curso; se mostrará su resultado al terminar.")
 
-                            estado["usdt"] += recuperado
-                            estado["moneda_activa"] = None
-                            estado["cantidad_cripto"] = 0.0
-                            estado["historial"].insert(
-                                0, f"[{ahora}] VENTA {sym} a ${precio:.4f} ({cambio_pct:+.2f}% | {pnl:+.2f} USDT) | {motivo}"
-                            )
+    position = state.get("position")
+    prices = {symbol: item["price"] for symbol, item in state.get("radar", {}).items()}
+    equity = current_equity(state, prices)
+    pnl = equity - state["initial_balance"]
+    pnl_pct = 100.0 * pnl / state["initial_balance"] if state["initial_balance"] else 0.0
+    total_closed = state["wins"] + state["losses"]
+    win_rate = 100.0 * state["wins"] / total_closed if total_closed else None
+    loss_amount = sum(abs(t["pnl"]) for t in state["trades"] if t.get("pnl") is not None and t["pnl"] < 0)
+    gain_amount = sum(t["pnl"] for t in state["trades"] if t.get("pnl") is not None and t["pnl"] > 0)
+    profit_factor = gain_amount / loss_amount if loss_amount > 0 else (math.inf if gain_amount > 0 else None)
 
-                # 4. Actualizar métricas de riesgo (Drawdown y Cartera)
-                valor_pos = estado["cantidad_cripto"] * estado["precio_actual_activa"] if estado["moneda_activa"] else 0.0
-                cartera_total = estado["usdt"] + valor_pos
-                if cartera_total > estado["max_cartera"]:
-                    estado["max_cartera"] = cartera_total
-                dd_actual = ((estado["max_cartera"] - cartera_total) / estado["max_cartera"]) * 100.0
-                if dd_actual > estado["max_drawdown"]:
-                    estado["max_drawdown"] = dd_actual
+    cols = st.columns(4)
+    cols[0].metric("Patrimonio estimado", f"{equity:,.2f} USDT", f"{pnl_pct:+.2f} %")
+    cols[1].metric("Efectivo libre", f"{state['cash']:,.2f} USDT")
+    cols[2].metric("Operaciones cerradas", str(total_closed), f"{state['wins']} ganadas / {state['losses']} perdidas")
+    cols[3].metric("Drawdown máximo", f"{state['max_drawdown_pct']:.2f} %")
 
-                estado["ultima_actualizacion"] = ahora
-                estado["historial"] = estado["historial"][:35]
+    if position:
+        st.subheader(f"Posición simulada abierta: {position['symbol']}")
+        pcols = st.columns(4)
+        pcols[0].metric("Precio de entrada", f"{position['entry_price']:.6f}")
+        pcols[1].metric("Cantidad", f"{position['quantity']:.8f}")
+        pcols[2].metric("Stop loss", f"{position['stop_loss']:.6f}")
+        pcols[3].metric("Take profit", f"{position['take_profit']:.6f}")
+    else:
+        st.subheader("Sin posición abierta")
 
-                with open(ARCHIVO_ESTADO, 'w', encoding='utf-8') as f:
-                    json.dump(estado, f)
+    st.subheader("Radar de mercado")
+    rows = []
+    for symbol, item in state.get("radar", {}).items():
+        rows.append({
+            "Activo": symbol,
+            "Precio": item["price"],
+            "Tendencia": item["regime"],
+            "RSI": item["rsi"],
+            "Stoch RSI": item["stoch_rsi"],
+            "Libro compra %": item["buy_pressure"],
+            "Volumen x": item["volume_ratio"],
+            "Puntuación": item["score"],
+            "Motivos": item["reasons"],
+        })
+    if rows:
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+    else:
+        st.warning("Todavía no hay datos completos de mercado.")
 
-            except Exception as e:
-                estado["ultimo_comentario_ia"] = f"Sincronizando datos: {str(e)[:35]}"
-            time.sleep(25)
+    st.caption(f"Último ciclo UTC: {state.get('last_scan') or 'pendiente'}")
+    st.write(f"**Comentario del motor:** {state.get('last_comment', '-')}")
+    if state.get("last_error"):
+        st.warning(f"Incidencias de datos: {state['last_error']}")
 
-    threading.Thread(target=bucle_operativo, daemon=True).start()
-    return estado
+    st.subheader("Registro reciente")
+    trades = state.get("trades", [])
+    if trades:
+        st.dataframe(trades[:50], use_container_width=True, hide_index=True)
+        csv_data = "time,symbol,side,price,quantity,pnl,reason,candle_time\n"
+        for trade in trades:
+            values = [
+                trade.get("time", ""), trade.get("symbol", ""), trade.get("side", ""),
+                trade.get("price", ""), trade.get("quantity", ""),
+                trade.get("pnl", ""), str(trade.get("reason", "")).replace(",", ";"),
+                trade.get("candle_time", ""),
+            ]
+            csv_data += ",".join(str(value) for value in values) + "\n"
+        st.download_button(
+            "Descargar operaciones CSV",
+            data=csv_data,
+            file_name="operaciones_paper_trading.csv",
+            mime="text/csv",
+        )
+    else:
+        st.caption("Todavía no se ha ejecutado ninguna operación simulada.")
 
-# =====================================================================
-# 6. TERMINAL WEB PROFESIONAL (100% HTML/CSS SIN ERRORES DE MÓDULOS)
-# =====================================================================
-st.set_page_config(page_title="Terminal Cuantitativa IA 24/7", layout="wide")
-estado = iniciar_terminal_24_7()
+    st.caption(
+        f"Win rate: {win_rate:.1f} %" if win_rate is not None else "Win rate: sin operaciones cerradas"
+    )
+    if profit_factor is None:
+        st.caption("Profit factor: no disponible todavía.")
+    elif math.isinf(profit_factor):
+        st.caption("Profit factor: infinito (hay ganancias, pero aún no hay pérdidas cerradas).")
+    else:
+        st.caption(f"Profit factor: {profit_factor:.2f}")
 
-valor_pos = estado["cantidad_cripto"] * estado["precio_actual_activa"] if estado["moneda_activa"] else 0.0
-cartera = estado["usdt"] + valor_pos
-ganancia_neta = cartera - 1000.0
-pct_neto = (ganancia_neta / 1000.0) * 100.0
-total_ops = estado["ganadas"] + estado["perdidas"]
-win_rate = (estado["ganadas"] / total_ops * 100.0) if total_ops > 0 else 0.0
-profit_factor = (estado["ganancia_acumulada"] / estado["perdida_acumulada"]) if estado["perdida_acumulada"] > 0 else (estado["ganancia_acumulada"] if estado["ganancia_acumulada"] > 0 else 1.0)
 
-color_pnl = "#4ade80" if ganancia_neta >= 0 else "#f87171"
-texto_pos = f"{estado['moneda_activa']} (SL: ${estado['stop_loss']:.4f})" if estado["moneda_activa"] else "ESCANEANDO (Liquidez 100%)"
+live_panel()
 
-st.markdown(f"""
-<div style="background:linear-gradient(90deg, #0f172a, #1e293b); padding:18px 24px; border-radius:12px; border:1px solid #334155; margin-bottom:18px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
-    <div>
-        <h2 style="margin:0; color:#f8fafc; font-size:1.45rem;">Terminal Cuantitativa Multi-Cripto + IA ({estado['exchange']})</h2>
-        <div style="color:#94a3b8; font-size:0.85rem; margin-top:4px;">Último ciclo: {estado['ultima_actualizacion']} UTC | Escáner Order Book + 7 Indicadores</div>
-    </div>
-    <div style="background:#020617; padding:8px 16px; border-radius:8px; border:1px solid #38bdf8; color:#38bdf8; font-weight:bold;">
-        MODO 24/7 ACTIVO
-    </div>
-</div>
+st.divider()
+st.subheader("Análisis descriptivo opcional con Gemini")
+st.caption("Gemini solo comenta el radar. No cambia puntuaciones, no predice beneficios ni autoriza operaciones.")
+if st.button("Analizar el radar con Gemini"):
+    api_key = None
+    try:
+        api_key = st.secrets.get("GEMINI_API_KEY")
+    except Exception:
+        pass
+    api_key = api_key or os.environ.get("GEMINI_API_KEY")
+    state_for_ai = load_state()
+    if not api_key:
+        st.warning("Gemini está desactivado. Añade GEMINI_API_KEY en Streamlit Secrets para habilitarlo.")
+    elif genai is None:
+        st.error("No está instalado google-genai. Revisa requirements.txt.")
+    elif not state_for_ai.get("radar"):
+        st.warning("Aún no hay datos de mercado para analizar.")
+    else:
+        try:
+            client = genai.Client(api_key=api_key)
+            compact = [
+                {
+                    "activo": key,
+                    "precio": value["price"],
+                    "tendencia": value["regime"],
+                    "rsi": value["rsi"],
+                    "score": value["score"],
+                    "razones": value["reasons"],
+                }
+                for key, value in state_for_ai["radar"].items()
+            ]
+            prompt = (
+                "Eres un comentarista educativo de datos de mercado. Resume el radar en español, "
+                "señala incertidumbres y riesgos, no des órdenes de compra/venta ni promesas de rentabilidad. "
+                "Aclara que una puntuación heurística no es una probabilidad de éxito. Datos: "
+                + json.dumps(compact, ensure_ascii=False)
+            )
+            response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
+            st.write(response.text or "Gemini no devolvió texto.")
+        except Exception as exc:
+            st.error(f"No se pudo consultar Gemini: {str(exc)[:250]}")
 
-<div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); gap:12px; margin-bottom:18px;">
-    <div style="background:#1e293b; padding:16px; border-radius:10px; border:1px solid #334155;">
-        <div style="color:#94a3b8; font-size:0.8rem;">VALOR NETO CARTERA</div>
-        <div style="color:#f8fafc; font-size:1.55rem; font-weight:bold;">${cartera:.2f} <span style="font-size:0.95rem; color:{color_pnl};">({pct_neto:+.2f}%)</span></div>
-    </div>
-    <div style="background:#1e293b; padding:16px; border-radius:10px; border:1px solid #334155;">
-        <div style="color:#94a3b8; font-size:0.8rem;">POSICIÓN ACTUAL</div>
-        <div style="color:#38bdf8; font-size:1.25rem; font-weight:bold; margin-top:4px;">{texto_pos}</div>
-    </div>
-    <div style="background:#1e293b; padding:16px; border-radius:10px; border:1px solid #334155;">
-        <div style="color:#94a3b8; font-size:0.8rem;">WIN RATE / OPERACIONES</div>
-        <div style="color:#f8fafc; font-size:1.4rem; font-weight:bold;">{win_rate:.0f}% <span style="font-size:0.9rem; color:#94a3b8;">({estado['ganadas']}W / {estado['perdidas']}L)</span></div>
-    </div>
-    <div style="background:#1e293b; padding:16px; border-radius:10px; border:1px solid #334155;">
-        <div style="color:#94a3b8; font-size:0.8rem;">PROFIT FACTOR / DRAWDOWN</div>
-        <div style="color:#facc15; font-size:1.4rem; font-weight:bold;">{profit_factor:.2f}x <span style="font-size:0.9rem; color:#94a3b8;">(DD: {estado['max_drawdown']:.2f}%)</span></div>
-    </div>
-</div>
+st.divider()
+st.warning(
+    "Limitaciones importantes: la simulación usa velas de 1 minuto cerradas y supuestos fijos de comisión "
+    "y deslizamiento. No representa la ejecución real, no garantiza que un stop pueda ejecutarse al precio "
+    "indicado y no demuestra que la estrategia tenga ventaja estadística. Hace falta backtesting fuera de "
+    "muestra y pruebas prolongadas en papel antes de plantearse cualquier uso con dinero real."
+)
 
-<div style="background:#0f172a; padding:14px 18px; border-radius:10px; border-left:4px solid #38bdf8; margin-bottom:20px; color:#e2e8f0; font-size:0.95rem;">
-    <strong>Dictamen del Comité IA:</strong> {estado['ultimo_comentario_ia']}
-</div>
-""", unsafe_allow_html=True)
-
-# Tabla HTML del Radar Multi-Cripto en Tiempo Real
-filas_html = ""
-for sym in MONEDAS:
-    d = estado["radar"].get(sym)
-    if d:
-        color_score = "#4ade80" if d["score"] >= 65 else ("#facc15" if d["score"] >= 45 else "#94a3b8")
-        color_reg = "#4ade80" if d["regimen"] == "ALCISTA" else ("#f87171" if d["regimen"] == "DESPLOME" else "#cbd5e1")
-        filas_html += f"""
-        <tr style="border-bottom:1px solid #1e293b;">
-            <td style="padding:10px; font-weight:bold; color:#f8fafc;">{sym}</td>
-            <td style="padding:10px; color:#e2e8f0;">${d['precio']:.4f}</td>
-            <td style="padding:10px; color:{color_reg}; font-weight:bold;">{d['regimen']}</td>
-            <td style="padding:10px; color:#e2e8f0;">{d['rsi']} / {d['stoch_rsi']}</td>
-            <td style="padding:10px; color:#38bdf8;">{d['presion_compras']}% Bids</td>
-            <td style="padding:10px; color:{color_score}; font-weight:bold; font-size:1.05rem;">{d['score']} / 100</td>
-            <td style="padding:10px; color:#94a3b8; font-size:0.85rem;">{d['razones']}</td>
-        </tr>
-        """
-
-st.markdown(f"""
-<div style="background:#0f172a; border-radius:10px; border:1px solid #334155; overflow-x:auto; margin-bottom:20px;">
-    <div style="padding:12px 16px; background:#1e293b; font-weight:bold; color:#f8fafc;">Radar Cuantitativo en Tiempo Real (Compra automática con Score >= 65)</div>
-    <table style="width:100%; border-collapse:collapse; text-align:left; font-size:0.92rem;">
-        <thead>
-            <tr style="border-bottom:1px solid #334155; color:#94a3b8; background:#020617;">
-                <th style="padding:10px;">Activo</th>
-                <th style="padding:10px;">Precio</th>
-                <th style="padding:10px;">Régimen</th>
-                <th style="padding:10px;">RSI / StochRSI</th>
-                <th style="padding:10px;">Presión Ballenas</th>
-                <th style="padding:10px;">Score</th>
-                <th style="padding:10px;">Señales Detectadas</th>
-            </tr>
-        </thead>
-        <tbody>
-            {filas_html if filas_html else '<tr><td colspan="7" style="padding:14px; color:#94a3b8;">Escaneando los 5 mercados en vivo... espera unos segundos.</td></tr>'}
-        </tbody>
-    </table>
-</div>
-""", unsafe_allow_html=True)
-
-st.subheader("Registro de Operaciones Ejecutadas")
-if estado["historial"]:
-    csv_export = "Operacion\n" + "\n".join(estado["historial"])
-    st.download_button("Descargar Historial en CSV (Excel)", data=csv_export, file_name="historial_bot_pro.csv", mime="text/csv")
-    for item in estado["historial"]:
-        st.code(item)
-else:
-    st.caption("Vigilando los 5 mercados en vivo. En cuanto una criptomoneda alcance 65/100 puntos se registrará la compra aquí.")
-
-time.sleep(15)
-st.rerun()
+with st.expander("Reiniciar la cuenta ficticia"):
+    st.write("Esto borra el saldo, la posición y el historial guardados en esta instancia.")
+    confirm_reset = st.checkbox("Confirmo que quiero reiniciar la cuenta ficticia")
+    if st.button("Reiniciar simulación", disabled=not confirm_reset):
+        reset_state()
+        st.success("Cuenta de simulación reiniciada. Recarga la página para comenzar de nuevo.")

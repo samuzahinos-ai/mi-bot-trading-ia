@@ -1,0 +1,24 @@
+name: Validate paper trading app
+
+on:
+  pull_request:
+  push:
+    branches:
+      - mejoras-paper-trading
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install runtime dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+      - name: Import runtime dependencies
+        run: python -c "import ccxt, streamlit; from google import genai"
+      - name: Compile application
+        run: python -m py_compile app.py
+      - name: Check required files
+        run: test -s requirements.txt && test -s README.md
