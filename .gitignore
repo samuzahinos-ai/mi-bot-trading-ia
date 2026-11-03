@@ -1,0 +1,21 @@
+# Secrets and local configuration
+.env
+.env.*
+.streamlit/secrets.toml
+
+# Local paper-trading state
+*.sqlite
+*.sqlite3
+*.db
+estado_bot_pro.json
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor / operating system files
+.vscode/
+.DS_Store
+Thumbs.db
