@@ -1,538 +1,132 @@
+import csv
+import io
 import json
-import math
 import os
-import sqlite3
-import threading
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 
-import ccxt
 import streamlit as st
 
-# Gemini solo redacta un comentario opcional. Nunca decide ni autoriza operaciones.
 try:
     from google import genai
 except Exception:
     genai = None
 
-st.set_page_config(page_title="Bot de trading | Simulación", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Bot de trading | Paper 24/7", page_icon="📊", layout="wide")
 
-# ----------------------------- CONFIGURACIÓN -----------------------------
-PAIRS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"]
-TIMEFRAME = "1m"
-CANDLE_LIMIT = 700
-INITIAL_BALANCE = 1000.0
-FEE_RATE = 0.001              # 0,10 % por lado; supuesto configurable
-SLIPPAGE_RATE = 0.0005        # 0,05 % por lado; supuesto de simulación
-RISK_PER_TRADE = 0.01         # Riesgo teórico del 1 % del patrimonio hasta el stop
-MAX_ALLOCATION = 0.25         # Máximo 25 % del efectivo en una posición
-MAX_DAILY_LOSS = 0.03         # Bloquea nuevas entradas al perder 3 % en el día
-MIN_SCORE = 70
-DB_PATH = os.environ.get("PAPER_DB_PATH", "paper_trading.sqlite3")
+OWNER = "samuzahinos-ai"
+REPO = "mi-bot-trading-ia"
+STATE_URL = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/bot-state/paper_state.json"
+WORKFLOW_URL = f"https://github.com/{OWNER}/{REPO}/actions/workflows/paper-bot.yml"
 MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
-
-
-def utc_now():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def default_state():
     return {
-        "cash": INITIAL_BALANCE,
-        "initial_balance": INITIAL_BALANCE,
+        "cash": 1000.0,
+        "initial_balance": 1000.0,
         "position": None,
         "trades": [],
         "realized_pnl": 0.0,
         "wins": 0,
         "losses": 0,
-        "peak_equity": INITIAL_BALANCE,
+        "peak_equity": 1000.0,
         "max_drawdown_pct": 0.0,
-        "day": datetime.now(timezone.utc).date().isoformat(),
-        "day_start_equity": INITIAL_BALANCE,
-        "daily_realized_pnl": 0.0,
         "last_scan": None,
+        "worker_last_run": None,
         "last_error": None,
-        "last_comment": "Esperando el primer escaneo.",
+        "last_comment": "Esperando la primera ejecución automática.",
         "radar": {},
+        "bot_enabled": True,
     }
 
 
-def db_connection():
-    con = sqlite3.connect(DB_PATH, timeout=20)
-    con.execute(
-        "CREATE TABLE IF NOT EXISTS bot_state (id INTEGER PRIMARY KEY CHECK (id = 1), payload TEXT NOT NULL)"
-    )
-    con.commit()
-    return con
-
-
-def load_state():
-    con = db_connection()
+def fetch_state():
+    url = f"{STATE_URL}?v={int(time.time())}"
+    request = urllib.request.Request(url, headers={"Cache-Control": "no-cache", "User-Agent": "paper-trading-dashboard"})
     try:
-        row = con.execute("SELECT payload FROM bot_state WHERE id = 1").fetchone()
-        if row is None:
+        with urllib.request.urlopen(request, timeout=12) as response:
             state = default_state()
-            con.execute(
-                "INSERT INTO bot_state (id, payload) VALUES (1, ?)",
-                (json.dumps(state),),
-            )
-            con.commit()
-            return state
-        state = default_state()
-        state.update(json.loads(row[0]))
-        return state
-    finally:
-        con.close()
+            state.update(json.loads(response.read().decode("utf-8")))
+            return state, None
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return default_state(), "El motor aún no ha guardado su primera lectura. Ejecuta el flujo de GitHub Actions."
+        return default_state(), f"GitHub respondió con HTTP {exc.code}."
+    except Exception as exc:
+        return default_state(), f"No se pudo leer el estado remoto: {str(exc)[:180]}"
 
 
-def save_state(state):
-    con = db_connection()
+def age_minutes(timestamp):
+    if not timestamp:
+        return None
     try:
-        con.execute(
-            "INSERT INTO bot_state (id, payload) VALUES (1, ?) "
-            "ON CONFLICT(id) DO UPDATE SET payload = excluded.payload",
-            (json.dumps(state),),
-        )
-        con.commit()
-    finally:
-        con.close()
-
-
-def reset_state():
-    con = db_connection()
-    try:
-        con.execute("DELETE FROM bot_state WHERE id = 1")
-        con.commit()
-    finally:
-        con.close()
-
-
-@st.cache_resource
-def get_runtime():
-    exchange_id = os.environ.get("EXCHANGE_ID", "kraken").lower()
-    if exchange_id not in {"kraken", "binance", "bybit", "coinbase"}:
-        raise ValueError("EXCHANGE_ID no válido. Usa kraken, binance, bybit o coinbase.")
-    exchange_class = getattr(ccxt, exchange_id)
-    exchange = exchange_class({
-        "enableRateLimit": True,
-        "timeout": 15000,
-        "options": {"defaultType": "spot"},
-    })
-    exchange.load_markets()
-    available = [symbol for symbol in PAIRS if symbol in exchange.markets]
-    return exchange, exchange_id.upper(), available, threading.Lock()
-
-
-# ----------------------------- INDICADORES -----------------------------
-def ema_series(values, period):
-    if len(values) < period:
-        raise ValueError("No hay suficientes datos para calcular EMA.")
-    k = 2.0 / (period + 1.0)
-    current = sum(values[:period]) / period
-    result = [None] * (period - 1) + [current]
-    for value in values[period:]:
-        current = value * k + current * (1.0 - k)
-        result.append(current)
-    return result
-
-
-def rsi_series(closes, period=14):
-    if len(closes) <= period:
-        raise ValueError("No hay suficientes datos para RSI.")
-    changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-    gains = [max(change, 0.0) for change in changes]
-    losses = [max(-change, 0.0) for change in changes]
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    result = [None] * period
-    result.append(100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss))
-    for i in range(period, len(changes)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        result.append(100.0 if avg_loss == 0 else 100.0 - 100.0 / (1.0 + avg_gain / avg_loss))
-    return result
-
-
-def macd_histogram(closes):
-    fast = ema_series(closes, 12)
-    slow = ema_series(closes, 26)
-    start = 25
-    macd = [fast[i] - slow[i] for i in range(start, len(closes))]
-    signal = ema_series(macd, 9)
-    return macd[-1] - signal[-1], macd[-2] - signal[-2]
-
-
-def atr_value(candles, period=14):
-    true_ranges = []
-    for i in range(1, len(candles)):
-        high, low, previous_close = candles[i][2], candles[i][3], candles[i - 1][4]
-        true_ranges.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
-    return sum(true_ranges[-period:]) / period
-
-
-def rolling_vwap(candles, period=50):
-    recent = candles[-period:]
-    volume = sum(row[5] for row in recent)
-    if volume <= 0:
-        return recent[-1][4]
-    return sum(((row[2] + row[3] + row[4]) / 3.0) * row[5] for row in recent) / volume
-
-
-def order_book_pressure(exchange, symbol):
-    try:
-        book = exchange.fetch_order_book(symbol, limit=15)
-        bid_value = sum(price * amount for price, amount in book.get("bids", [])[:15])
-        ask_value = sum(price * amount for price, amount in book.get("asks", [])[:15])
-        total = bid_value + ask_value
-        return 100.0 * bid_value / total if total > 0 else 50.0
+        dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 60.0)
     except Exception:
-        return 50.0
+        return None
 
 
-def evaluate_pair(exchange, symbol, candles):
-    if len(candles) < 230:
-        raise ValueError("Se requieren al menos 230 velas cerradas.")
-    closes = [row[4] for row in candles]
-    volumes = [row[5] for row in candles]
-    price = closes[-1]
-
-    ema50 = ema_series(closes, 50)[-1]
-    ema200 = ema_series(closes, 200)[-1]
-    rsi_values = rsi_series(closes, 14)
-    rsi = rsi_values[-1]
-    valid_rsi = [value for value in rsi_values[-14:] if value is not None]
-    stoch = 50.0
-    if valid_rsi and max(valid_rsi) != min(valid_rsi):
-        stoch = 100.0 * (valid_rsi[-1] - min(valid_rsi)) / (max(valid_rsi) - min(valid_rsi))
-
-    macd_now, macd_previous = macd_histogram(closes)
-    atr = atr_value(candles, 14)
-    vwap = rolling_vwap(candles, 50)
-    pressure = order_book_pressure(exchange, symbol)
-    average_volume = sum(volumes[-21:-1]) / 20.0
-    volume_ratio = volumes[-1] / average_volume if average_volume > 0 else 1.0
-
-    if price > ema50 > ema200:
-        regime = "ALCISTA"
-    elif price < ema200 and (ema200 - price) / ema200 > 0.008:
-        regime = "BAJISTA FUERTE"
-    else:
-        regime = "LATERAL"
-
-    score = 0
-    reasons = []
-    if price > ema50 > ema200:
-        score += 25
-        reasons.append("tendencia EMA alcista")
-    if 38 <= rsi <= 62:
-        score += 15
-        reasons.append("RSI en zona moderada")
-    elif 30 <= rsi < 38 and regime == "ALCISTA":
-        score += 10
-        reasons.append("posible retroceso en tendencia")
-    if macd_now > macd_previous and macd_now > 0:
-        score += 20
-        reasons.append("impulso MACD positivo")
-    elif macd_now > macd_previous:
-        score += 10
-        reasons.append("MACD mejorando")
-    if price > vwap:
-        score += 10
-        reasons.append("precio sobre VWAP móvil")
-    if volume_ratio >= 1.2:
-        score += 10
-        reasons.append("volumen superior a la media")
-    if pressure >= 55:
-        score += 10
-        reasons.append("libro inclinado a compras")
-    if atr > 0 and atr / price < 0.02:
-        score += 10
-        reasons.append("volatilidad dentro del límite")
-    if rsi > 72:
-        score -= 15
-        reasons.append("RSI elevado")
-    if regime == "BAJISTA FUERTE":
-        score -= 25
-        reasons.append("tendencia bajista fuerte")
-
-    return {
-        "symbol": symbol,
-        "timestamp": int(candles[-1][0]),
-        "price": price,
-        "open": candles[-1][1],
-        "high": candles[-1][2],
-        "low": candles[-1][3],
-        "rsi": round(rsi, 1),
-        "stoch_rsi": round(stoch, 1),
-        "atr": atr,
-        "vwap": vwap,
-        "buy_pressure": round(pressure, 1),
-        "volume_ratio": round(volume_ratio, 2),
-        "regime": regime,
-        "score": max(0, min(100, score)),
-        "reasons": ", ".join(reasons) if reasons else "sin señal clara",
-    }
-
-
-# -------------------------- SIMULADOR DE ÓRDENES -------------------------
-def current_equity(state, prices=None):
-    prices = prices or {}
-    position = state.get("position")
-    if not position:
-        return float(state["cash"])
-    mark = prices.get(position["symbol"], position["last_price"])
-    # Valoración neta estimada: descuenta comisión de una hipotética salida.
-    return float(state["cash"]) + position["quantity"] * mark * (1.0 - FEE_RATE)
-
-
-def close_position(state, exit_price, reason, candle_time):
-    pos = state["position"]
-    proceeds = pos["quantity"] * exit_price * (1.0 - FEE_RATE)
-    pnl = proceeds - pos["entry_total_cost"]
-    state["cash"] += proceeds
-    state["realized_pnl"] += pnl
-    state["daily_realized_pnl"] += pnl
-    if pnl >= 0:
-        state["wins"] += 1
-    else:
-        state["losses"] += 1
-    state["trades"].insert(0, {
-        "time": utc_now(),
-        "symbol": pos["symbol"],
-        "side": "VENTA",
-        "price": round(exit_price, 8),
-        "quantity": round(pos["quantity"], 8),
-        "pnl": round(pnl, 4),
-        "reason": reason,
-        "candle_time": candle_time,
-    })
-    state["trades"] = state["trades"][:200]
-    state["last_comment"] = f"Cierre simulado {pos['symbol']}: {reason}. PnL neto {pnl:+.2f} USDT."
-    state["position"] = None
-
-
-def manage_open_position(state, info):
-    pos = state.get("position")
-    if not pos or info["symbol"] != pos["symbol"]:
-        return
-    if info["timestamp"] <= pos.get("last_candle_ts", 0):
-        return
-
-    stop = pos["stop_loss"]
-    target = pos["take_profit"]
-    low, high, opening, close = info["low"], info["high"], info["open"], info["price"]
-
-    # Si en una misma vela se tocaron stop y objetivo, se supone que saltó primero el stop.
-    stop_hit = low <= stop
-    target_hit = high >= target
-    if stop_hit:
-        raw_exit = min(opening, stop)
-        exit_price = raw_exit * (1.0 - SLIPPAGE_RATE)
-        reason = "stop loss (prioridad conservadora intravela)"
-        close_position(state, exit_price, reason, info["timestamp"])
-        return
-    if target_hit:
-        exit_price = target * (1.0 - SLIPPAGE_RATE)
-        close_position(state, exit_price, "take profit", info["timestamp"])
-        return
-
-    if info["rsi"] >= 78 and close > pos["entry_price"]:
-        exit_price = close * (1.0 - SLIPPAGE_RATE)
-        close_position(state, exit_price, "salida por RSI extremo", info["timestamp"])
-        return
-
-    pos["last_price"] = close
-    pos["last_candle_ts"] = info["timestamp"]
-    pos["max_price"] = max(pos["max_price"], high)
-    # Break-even solo cuando la subida cubre aproximadamente comisiones y deslizamiento.
-    fee_buffer = 2.0 * FEE_RATE + 2.0 * SLIPPAGE_RATE
-    if pos["max_price"] >= pos["entry_price"] * (1.0 + fee_buffer + 0.003):
-        pos["stop_loss"] = max(pos["stop_loss"], pos["entry_price"] * (1.0 + fee_buffer))
-    trailing = pos["max_price"] - 1.8 * max(info["atr"], close * 0.001)
-    pos["stop_loss"] = max(pos["stop_loss"], trailing)
-
-
-def maybe_open_position(state, candidates, bot_enabled):
-    if not bot_enabled or state.get("position") is not None or not candidates:
-        return
-    today_equity = current_equity(state, {x["symbol"]: x["price"] for x in candidates})
-    daily_floor = state["day_start_equity"] * (1.0 - MAX_DAILY_LOSS)
-    if today_equity <= daily_floor or state["daily_realized_pnl"] <= -MAX_DAILY_LOSS * state["day_start_equity"]:
-        state["last_comment"] = "Límite diario de pérdida alcanzado: nuevas entradas bloqueadas."
-        return
-
-    candidates = sorted(candidates, key=lambda item: item["score"], reverse=True)
-    chosen = candidates[0]
-    if chosen["score"] < MIN_SCORE or chosen["regime"] != "ALCISTA" or chosen["atr"] <= 0:
-        state["last_comment"] = (
-            f"Sin entrada: mejor señal {chosen['symbol']} con {chosen['score']}/100; "
-            "se exige tendencia alcista y puntuación mínima."
-        )
-        return
-
-    if state.get("last_entry_candle") == chosen["timestamp"]:
-        return
-
-    equity = today_equity
-    entry_price = chosen["price"] * (1.0 + SLIPPAGE_RATE)
-    stop_distance = 1.5 * chosen["atr"]
-    risk_budget = equity * RISK_PER_TRADE
-    quantity_by_risk = risk_budget / stop_distance
-    max_spend = state["cash"] * MAX_ALLOCATION
-    quantity_by_allocation = max_spend / (entry_price * (1.0 + FEE_RATE))
-    quantity = min(quantity_by_risk, quantity_by_allocation)
-    total_cost = quantity * entry_price * (1.0 + FEE_RATE)
-
-    if quantity <= 0 or total_cost <= 0 or total_cost > state["cash"]:
-        state["last_comment"] = "Entrada omitida: tamaño de posición no válido."
-        return
-
-    state["cash"] -= total_cost
-    state["position"] = {
-        "symbol": chosen["symbol"],
-        "quantity": quantity,
-        "entry_price": entry_price,
-        "entry_total_cost": total_cost,
-        "stop_loss": entry_price - stop_distance,
-        "take_profit": entry_price + 2.5 * stop_distance,
-        "max_price": entry_price,
-        "last_price": chosen["price"],
-        "last_candle_ts": chosen["timestamp"],
-        "opened_at": utc_now(),
-    }
-    state["last_entry_candle"] = chosen["timestamp"]
-    state["trades"].insert(0, {
-        "time": utc_now(),
-        "symbol": chosen["symbol"],
-        "side": "COMPRA",
-        "price": round(entry_price, 8),
-        "quantity": round(quantity, 8),
-        "pnl": None,
-        "reason": f"score {chosen['score']}/100: {chosen['reasons']}",
-        "candle_time": chosen["timestamp"],
-    })
-    state["trades"] = state["trades"][:200]
-    state["last_comment"] = f"Compra simulada {chosen['symbol']}; score {chosen['score']}/100."
-
-
-def run_cycle(exchange, symbols, state, bot_enabled):
-    now_day = datetime.now(timezone.utc).date().isoformat()
-    if state.get("day") != now_day:
-        state["day"] = now_day
-        state["day_start_equity"] = current_equity(state)
-        state["daily_realized_pnl"] = 0.0
-
-    radar = {}
-    candle_data = {}
-    errors = []
-    for symbol in symbols:
-        try:
-            raw = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
-            # La última vela suele estar abierta. No se usa para indicadores ni decisiones.
-            closed = raw[:-1]
-            if len(closed) < 230:
-                raise ValueError("histórico insuficiente")
-            info = evaluate_pair(exchange, symbol, closed)
-            radar[symbol] = info
-            candle_data[symbol] = closed[-1]
-        except Exception as exc:
-            errors.append(f"{symbol}: {str(exc)[:100]}")
-
-    state["radar"] = radar
-    if state.get("position"):
-        active_symbol = state["position"]["symbol"]
-        active_info = radar.get(active_symbol)
-        if active_info:
-            manage_open_position(state, active_info)
-
-    if state.get("position") is None:
-        maybe_open_position(state, list(radar.values()), bot_enabled)
-
-    prices = {symbol: item["price"] for symbol, item in radar.items()}
-    equity = current_equity(state, prices)
-    state["peak_equity"] = max(state.get("peak_equity", INITIAL_BALANCE), equity)
-    if state["peak_equity"] > 0:
-        drawdown = 100.0 * (state["peak_equity"] - equity) / state["peak_equity"]
-        state["max_drawdown_pct"] = max(state.get("max_drawdown_pct", 0.0), drawdown)
-    state["last_scan"] = utc_now()
-    state["last_error"] = " | ".join(errors) if errors else None
-    if not radar and errors:
-        state["last_comment"] = "No se recibieron datos válidos. Revisa el exchange y sus mercados."
-    save_state(state)
-    return state
-
-
-# ------------------------------- INTERFAZ --------------------------------
 st.title("📊 Bot de trading con simulación")
-st.caption("Solo datos públicos y operaciones ficticias. No se envían órdenes al exchange.")
+st.caption("Motor programado en GitHub Actions · Datos públicos de Kraken · Solo dinero ficticio · Sin órdenes reales")
 
 with st.sidebar:
-    st.header("Control")
-    bot_enabled = st.toggle("Permitir nuevas entradas simuladas", value=True)
-    st.caption("Al desactivarlo, se bloquean nuevas compras; la posición abierta sigue gestionándose.")
+    st.header("Control remoto")
+    st.markdown(f"[Abrir GitHub Actions para pausar o reanudar nuevas entradas](<{WORKFLOW_URL}>)")
+    st.caption(
+        "En GitHub: Actions → Bot paper trading cada 5 minutos → Run workflow. "
+        "Marca o desmarca allow_entries y pulsa Run workflow. "
+        "Aunque desactives nuevas entradas, el motor seguirá gestionando una posición abierta."
+    )
     st.divider()
     st.write("**Supuestos del simulador**")
-    st.write(f"Comisión: {FEE_RATE * 100:.2f} % por lado")
-    st.write(f"Deslizamiento: {SLIPPAGE_RATE * 100:.2f} % por lado")
-    st.write(f"Riesgo teórico por operación: {RISK_PER_TRADE * 100:.1f} %")
-    st.write(f"Máxima asignación: {MAX_ALLOCATION * 100:.0f} % del efectivo")
-    st.write(f"Pérdida diaria máxima: {MAX_DAILY_LOSS * 100:.0f} %")
-
-try:
-    exchange, exchange_name, available_symbols, cycle_lock = get_runtime()
-except Exception as exc:
-    st.error(f"No se pudo inicializar el exchange: {exc}")
-    st.stop()
-
-if not available_symbols:
-    st.error(
-        f"{exchange_name} no anuncia ninguno de los pares configurados ({', '.join(PAIRS)}). "
-        "Cambia EXCHANGE_ID en la configuración."
-    )
-    st.stop()
-
-missing = sorted(set(PAIRS) - set(available_symbols))
-if missing:
-    st.warning(f"Pares no disponibles en {exchange_name}: {', '.join(missing)}. Se omiten.")
-
-st.info(
-    f"Fuente de precios: {exchange_name} | Marco temporal: {TIMEFRAME} | "
-    f"Activos analizados: {', '.join(available_symbols)}"
-)
+    st.write("Comisión: 0,10 % por lado")
+    st.write("Deslizamiento: 0,05 % por lado")
+    st.write("Riesgo teórico: 1 % por operación")
+    st.write("Máxima asignación: 25 % del efectivo")
+    st.write("Pérdida diaria máxima: 3 %")
+    st.divider()
+    st.caption("El motor se ejecuta cada 5 minutos. El panel puede dormir sin detener el motor.")
 
 
-@st.fragment(run_every="30s")
-def live_panel():
-    if cycle_lock.acquire(blocking=False):
-        try:
-            state = load_state()
-            state = run_cycle(exchange, available_symbols, state, bot_enabled)
-        except Exception as exc:
-            st.error(f"Error durante el ciclo: {exc}")
-            state = load_state()
-            state["last_error"] = str(exc)[:250]
-            save_state(state)
-        finally:
-            cycle_lock.release()
+@st.fragment(run_every="60s")
+def dashboard():
+    state, read_warning = fetch_state()
+
+    if read_warning:
+        st.warning(read_warning)
+
+    last_run = state.get("worker_last_run") or state.get("last_scan")
+    age = age_minutes(last_run)
+    if age is None:
+        st.info("Estado: esperando la primera ejecución de GitHub Actions.")
+    elif age > 15:
+        st.error(f"El motor no informa de una ejecución reciente. Último ciclo hace {age:.0f} minutos.")
+    elif state.get("bot_enabled", True):
+        st.success(f"Motor activo · última ejecución hace {age:.1f} minutos (horario aproximado cada 5 minutos).")
     else:
-        state = load_state()
-        st.caption("Hay otro ciclo de análisis en curso; se mostrará su resultado al terminar.")
+        st.warning(f"Motor en pausa de nuevas entradas · última ejecución hace {age:.1f} minutos. Gestiona posiciones abiertas.")
 
     position = state.get("position")
     prices = {symbol: item["price"] for symbol, item in state.get("radar", {}).items()}
-    equity = current_equity(state, prices)
-    pnl = equity - state["initial_balance"]
-    pnl_pct = 100.0 * pnl / state["initial_balance"] if state["initial_balance"] else 0.0
-    total_closed = state["wins"] + state["losses"]
+    if position:
+        mark = prices.get(position["symbol"], position.get("last_price", position["entry_price"]))
+        equity = state["cash"] + position["quantity"] * mark * (1.0 - 0.001)
+    else:
+        equity = state["cash"]
+    initial = float(state.get("initial_balance", 1000.0))
+    pnl = equity - initial
+    pnl_pct = 100.0 * pnl / initial if initial else 0.0
+    total_closed = int(state.get("wins", 0)) + int(state.get("losses", 0))
     win_rate = 100.0 * state["wins"] / total_closed if total_closed else None
-    loss_amount = sum(abs(t["pnl"]) for t in state["trades"] if t.get("pnl") is not None and t["pnl"] < 0)
-    gain_amount = sum(t["pnl"] for t in state["trades"] if t.get("pnl") is not None and t["pnl"] > 0)
-    profit_factor = gain_amount / loss_amount if loss_amount > 0 else (math.inf if gain_amount > 0 else None)
 
     cols = st.columns(4)
     cols[0].metric("Patrimonio estimado", f"{equity:,.2f} USDT", f"{pnl_pct:+.2f} %")
     cols[1].metric("Efectivo libre", f"{state['cash']:,.2f} USDT")
     cols[2].metric("Operaciones cerradas", str(total_closed), f"{state['wins']} ganadas / {state['losses']} perdidas")
-    cols[3].metric("Drawdown máximo", f"{state['max_drawdown_pct']:.2f} %")
+    cols[3].metric("Drawdown máximo", f"{state.get('max_drawdown_pct', 0.0):.2f} %")
 
     if position:
         st.subheader(f"Posición simulada abierta: {position['symbol']}")
@@ -545,9 +139,9 @@ def live_panel():
         st.subheader("Sin posición abierta")
 
     st.subheader("Radar de mercado")
-    rows = []
+    radar_rows = []
     for symbol, item in state.get("radar", {}).items():
-        rows.append({
+        radar_rows.append({
             "Activo": symbol,
             "Precio": item["price"],
             "Tendencia": item["regime"],
@@ -558,54 +152,52 @@ def live_panel():
             "Puntuación": item["score"],
             "Motivos": item["reasons"],
         })
-    if rows:
-        st.table(rows)
+    if radar_rows:
+        st.table(radar_rows)
     else:
-        st.warning("Todavía no hay datos completos de mercado.")
+        st.info("El radar estará disponible después del primer ciclo automático.")
 
-    st.caption(f"Último ciclo UTC: {state.get('last_scan') or 'pendiente'}")
+    st.caption(f"Último escaneo UTC: {state.get('last_scan') or 'pendiente'}")
     st.write(f"**Comentario del motor:** {state.get('last_comment', '-')}")
     if state.get("last_error"):
-        st.warning(f"Incidencias de datos: {state['last_error']}")
+        st.warning(f"Incidencias de mercado: {state['last_error']}")
 
     st.subheader("Registro reciente")
     trades = state.get("trades", [])
     if trades:
         st.table(trades[:50])
-        csv_data = "time,symbol,side,price,quantity,pnl,reason,candle_time\n"
-        for trade in trades:
-            values = [
-                trade.get("time", ""), trade.get("symbol", ""), trade.get("side", ""),
-                trade.get("price", ""), trade.get("quantity", ""),
-                trade.get("pnl", ""), str(trade.get("reason", "")).replace(",", ";"),
-                trade.get("candle_time", ""),
-            ]
-            csv_data += ",".join(str(value) for value in values) + "\n"
+        output = io.StringIO()
+        fields = ["time", "symbol", "side", "price", "quantity", "pnl", "reason", "candle_time"]
+        writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(trades)
         st.download_button(
             "Descargar operaciones CSV",
-            data=csv_data,
+            data=output.getvalue(),
             file_name="operaciones_paper_trading.csv",
             mime="text/csv",
         )
     else:
-        st.caption("Todavía no se ha ejecutado ninguna operación simulada.")
+        st.caption("Todavía no hay operaciones guardadas.")
 
     st.caption(
         f"Win rate: {win_rate:.1f} %" if win_rate is not None else "Win rate: sin operaciones cerradas"
     )
-    if profit_factor is None:
-        st.caption("Profit factor: no disponible todavía.")
-    elif math.isinf(profit_factor):
-        st.caption("Profit factor: infinito (hay ganancias, pero aún no hay pérdidas cerradas).")
+    if state.get("losses", 0):
+        gain_amount = sum(t["pnl"] for t in trades if t.get("pnl") is not None and t["pnl"] > 0)
+        loss_amount = sum(abs(t["pnl"]) for t in trades if t.get("pnl") is not None and t["pnl"] < 0)
+        st.caption(f"Profit factor reciente: {gain_amount / loss_amount:.2f}" if loss_amount else "Profit factor: no disponible.")
+    elif any(t.get("pnl", 0) and t["pnl"] > 0 for t in trades):
+        st.caption("Profit factor: infinito (todavía no hay operaciones perdedoras cerradas).")
     else:
-        st.caption(f"Profit factor: {profit_factor:.2f}")
+        st.caption("Profit factor: no disponible todavía.")
 
 
-live_panel()
+dashboard()
 
 st.divider()
 st.subheader("Análisis descriptivo opcional con Gemini")
-st.caption("Gemini solo comenta el radar. No cambia puntuaciones, no predice beneficios ni autoriza operaciones.")
+st.caption("Gemini solo comenta los datos del radar; no controla el motor automático ni autoriza operaciones.")
 if st.button("Analizar el radar con Gemini"):
     api_key = None
     try:
@@ -613,13 +205,13 @@ if st.button("Analizar el radar con Gemini"):
     except Exception:
         pass
     api_key = api_key or os.environ.get("GEMINI_API_KEY")
-    state_for_ai = load_state()
+    state_for_ai, warning = fetch_state()
     if not api_key:
-        st.warning("Gemini está desactivado. Añade GEMINI_API_KEY en Streamlit Secrets para habilitarlo.")
+        st.warning("Gemini está desactivado. Puedes añadir GEMINI_API_KEY en los Secrets de Streamlit.")
     elif genai is None:
         st.error("No está instalado google-genai. Revisa requirements.txt.")
     elif not state_for_ai.get("radar"):
-        st.warning("Aún no hay datos de mercado para analizar.")
+        st.warning("Todavía no hay datos de radar.")
     else:
         try:
             client = genai.Client(api_key=api_key)
@@ -635,9 +227,9 @@ if st.button("Analizar el radar con Gemini"):
                 for key, value in state_for_ai["radar"].items()
             ]
             prompt = (
-                "Eres un comentarista educativo de datos de mercado. Resume el radar en español, "
-                "señala incertidumbres y riesgos, no des órdenes de compra/venta ni promesas de rentabilidad. "
-                "Aclara que una puntuación heurística no es una probabilidad de éxito. Datos: "
+                "Resume en español este radar de mercado con fines educativos. "
+                "Señala riesgos e incertidumbres. No des órdenes de compra o venta ni prometas rentabilidad. "
+                "Aclara que la puntuación heurística no es una probabilidad de éxito. Datos: "
                 + json.dumps(compact, ensure_ascii=False)
             )
             response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
@@ -647,15 +239,8 @@ if st.button("Analizar el radar con Gemini"):
 
 st.divider()
 st.warning(
-    "Limitaciones importantes: la simulación usa velas de 1 minuto cerradas y supuestos fijos de comisión "
-    "y deslizamiento. No representa la ejecución real, no garantiza que un stop pueda ejecutarse al precio "
-    "indicado y no demuestra que la estrategia tenga ventaja estadística. Hace falta backtesting fuera de "
-    "muestra y pruebas prolongadas en papel antes de plantearse cualquier uso con dinero real."
+    "La automatización corre por intervalos de GitHub Actions, no como un proceso continuo. "
+    "Puede retrasarse o perder ejecuciones. Las comisiones, el deslizamiento y los precios de simulación "
+    "son aproximaciones; no demuestran ventaja estadística ni garantizan resultados. "
+    "Esta aplicación no envía órdenes al exchange."
 )
-
-with st.expander("Reiniciar la cuenta ficticia"):
-    st.write("Esto borra el saldo, la posición y el historial guardados en esta instancia.")
-    confirm_reset = st.checkbox("Confirmo que quiero reiniciar la cuenta ficticia")
-    if st.button("Reiniciar simulación", disabled=not confirm_reset):
-        reset_state()
-        st.success("Cuenta de simulación reiniciada. Recarga la página para comenzar de nuevo.")
