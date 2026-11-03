@@ -337,6 +337,33 @@ def maybe_open_position(state, candidates, bot_enabled):
     state["last_comment"] = f"Compra simulada {chosen['symbol']}; score {chosen['score']}/100."
 
 
+def manage_position_with_history(state, symbol, closed_candles):
+    """Procesa cronológicamente todas las velas cerradas desde el ciclo anterior."""
+    position = state.get("position")
+    if not position or position.get("symbol") != symbol:
+        return
+
+    last_timestamp = int(position.get("last_candle_ts", 0))
+    for index, candle in enumerate(closed_candles):
+        if int(candle[0]) <= last_timestamp:
+            continue
+        history = closed_candles[:index + 1]
+        closes = [row[4] for row in history]
+        info = {
+            "symbol": symbol,
+            "timestamp": int(candle[0]),
+            "open": candle[1],
+            "high": candle[2],
+            "low": candle[3],
+            "price": candle[4],
+            "atr": atr_value(history, 14),
+            "rsi": rsi_series(closes, 14)[-1],
+        }
+        manage_open_position(state, info)
+        if state.get("position") is None:
+            return
+
+
 def run_cycle(exchange, symbols, state, bot_enabled):
     now_day = datetime.now(timezone.utc).date().isoformat()
     if state.get("day") != now_day:
@@ -345,7 +372,7 @@ def run_cycle(exchange, symbols, state, bot_enabled):
         state["daily_realized_pnl"] = 0.0
 
     radar = {}
-    candle_data = {}
+    candle_history = {}
     errors = []
     for symbol in symbols:
         try:
@@ -356,16 +383,16 @@ def run_cycle(exchange, symbols, state, bot_enabled):
                 raise ValueError("histórico insuficiente")
             info = evaluate_pair(exchange, symbol, closed)
             radar[symbol] = info
-            candle_data[symbol] = closed[-1]
+            candle_history[symbol] = closed
         except Exception as exc:
             errors.append(f"{symbol}: {str(exc)[:100]}")
 
     state["radar"] = radar
     if state.get("position"):
         active_symbol = state["position"]["symbol"]
-        active_info = radar.get(active_symbol)
-        if active_info:
-            manage_open_position(state, active_info)
+        active_history = candle_history.get(active_symbol)
+        if active_history:
+            manage_position_with_history(state, active_symbol, active_history)
 
     if state.get("position") is None:
         maybe_open_position(state, list(radar.values()), bot_enabled)
