@@ -5,6 +5,7 @@ from paper_engine import (
     default_state,
     ema_series,
     evaluate_pair,
+    manage_position_with_history,
     rsi_series,
 )
 
@@ -53,6 +54,31 @@ class PaperEngineTests(unittest.TestCase):
         self.assertLessEqual(info["score"], 100)
         self.assertEqual(info["symbol"], "BTC/USDT")
         self.assertIn(info["regime"], {"ALCISTA", "LATERAL", "BAJISTA FUERTE"})
+
+    def test_open_position_checks_all_candles_between_worker_runs(self):
+        candles = make_candles(320)
+        last_ts = candles[-1][0]
+        candles.extend([
+            [last_ts + 60_000, 100.0, 101.0, 99.5, 100.5, 1100.0],
+            [last_ts + 120_000, 100.5, 101.0, 99.0, 100.2, 1100.0],
+        ])
+        state = default_state()
+        state["cash"] = 0.0
+        state["position"] = {
+            "symbol": "BTC/USDT",
+            "quantity": 10.0,
+            "entry_price": 100.0,
+            "entry_total_cost": 1001.0,
+            "stop_loss": 100.0,
+            "take_profit": 150.0,
+            "max_price": 100.0,
+            "last_price": 100.0,
+            "last_candle_ts": last_ts,
+        }
+        manage_position_with_history(state, "BTC/USDT", candles)
+        self.assertIsNone(state["position"])
+        self.assertEqual(state["losses"], 1)
+        self.assertEqual(state["trades"][0]["side"], "VENTA")
 
     def test_close_position_counts_entry_fee_in_net_pnl(self):
         state = default_state()
