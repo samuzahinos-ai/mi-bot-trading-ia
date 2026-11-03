@@ -42,7 +42,8 @@ class PaperEngineTests(unittest.TestCase):
     def test_rsi_stays_in_valid_range(self):
         values = [100.0 + i * 0.1 for i in range(40)]
         result = rsi_series(values, 14)
-        self.assertEqual(len(result), len(values) - 1)
+        self.assertEqual(len(result), len(values))
+        self.assertIsNone(result[0])
         self.assertGreaterEqual(result[-1], 0.0)
         self.assertLessEqual(result[-1], 100.0)
 
