@@ -559,7 +559,7 @@ def live_panel():
             "Motivos": item["reasons"],
         })
     if rows:
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.table(rows)
     else:
         st.warning("Todavía no hay datos completos de mercado.")
 
@@ -571,7 +571,7 @@ def live_panel():
     st.subheader("Registro reciente")
     trades = state.get("trades", [])
     if trades:
-        st.dataframe(trades[:50], use_container_width=True, hide_index=True)
+        st.table(trades[:50])
         csv_data = "time,symbol,side,price,quantity,pnl,reason,candle_time\n"
         for trade in trades:
             values = [
