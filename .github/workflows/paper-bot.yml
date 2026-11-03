@@ -1,6 +1,16 @@
 name: Bot paper trading cada 5 minutos
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - "app.py"
+      - "paper_engine.py"
+      - "worker.py"
+      - "tests/**"
+      - "requirements-worker.txt"
+      - ".github/workflows/paper-bot.yml"
   schedule:
     - cron: "2-59/5 * * * *"
   workflow_dispatch:
@@ -19,7 +29,25 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  validate:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Obtener código
+        uses: actions/checkout@v4
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Instalar dependencias del motor
+        run: python -m pip install -r requirements-worker.txt
+      - name: Comprobar sintaxis
+        run: python -m py_compile app.py paper_engine.py worker.py
+      - name: Ejecutar pruebas del motor
+        run: python -m unittest discover -s tests -v
+
   run-paper-cycle:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 4
     steps:
@@ -49,8 +77,8 @@ jobs:
       - name: Ejecutar un ciclo de simulación
         env:
           EXCHANGE_ID: kraken
-          SET_BOT_ENABLED: \${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
-          BOT_ENABLED_INPUT: \${{ inputs.allow_entries }}
+          SET_BOT_ENABLED: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+          BOT_ENABLED_INPUT: ${{ inputs.allow_entries }}
           PYTHONUNBUFFERED: "1"
         run: python worker.py
 
