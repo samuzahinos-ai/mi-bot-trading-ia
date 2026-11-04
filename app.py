@@ -6,7 +6,9 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
+import pandas as pd
 import streamlit as st
 
 try:
@@ -59,6 +61,31 @@ def fetch_state():
         return default_state(), f"No se pudo leer el estado remoto: {str(exc)[:180]}"
 
 
+LOCAL_TZ = ZoneInfo("Europe/Madrid")
+
+
+def parse_utc(timestamp):
+    if not timestamp:
+        return None
+    try:
+        return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def local_time(timestamp):
+    """Convierte un instante ISO en UTC a la hora de Madrid para mostrarlo."""
+    dt = parse_utc(timestamp)
+    return dt.astimezone(LOCAL_TZ).strftime("%d/%m/%Y %H:%M:%S") if dt else "pendiente"
+
+
+def human_age(minutes):
+    if minutes < 90:
+        return f"{minutes:.0f} min"
+    hours, rest = divmod(int(minutes), 60)
+    return f"{hours} h {rest:02d} min"
+
+
 def age_minutes(timestamp):
     if not timestamp:
         return None
@@ -88,7 +115,8 @@ with st.sidebar:
     st.write("Máxima asignación: 25 % del efectivo")
     st.write("Pérdida diaria máxima: 3 %")
     st.divider()
-    st.caption("El motor se ejecuta cada 5 minutos. El panel puede dormir sin detener el motor.")
+    st.caption("El motor se ejecuta cada 5 minutos si el disparador externo está configurado (ver LEEME_24-7.md). "
+               "El panel puede dormir sin detener el motor.")
 
 
 @st.fragment(run_every="60s")
@@ -103,7 +131,15 @@ def dashboard():
     if age is None:
         st.info("Estado: esperando la primera ejecución de GitHub Actions.")
     elif age > 15:
-        st.error(f"El motor no informa de una ejecución reciente. Último ciclo hace {age:.0f} minutos.")
+        st.error(
+            f"El motor no informa de una ejecución reciente. Último ciclo hace {human_age(age)} "
+            f"({local_time(last_run)}, hora de Madrid)."
+        )
+        st.caption(
+            "Causa habitual: GitHub omite muchas ejecuciones programadas en repositorios pequeños. "
+            "Solución definitiva: configurar el disparador externo de LEEME_24-7.md. "
+            f"Para ejecutar un ciclo ahora: [abrir el flujo y pulsar Run workflow](<{WORKFLOW_URL}>)."
+        )
     elif state.get("bot_enabled", True):
         st.success(f"Motor activo · última ejecución hace {age:.1f} minutos (horario aproximado cada 5 minutos).")
     else:
@@ -153,11 +189,25 @@ def dashboard():
             "Motivos": item["reasons"],
         })
     if radar_rows:
-        st.table(radar_rows)
+        st.dataframe(
+            pd.DataFrame(radar_rows),
+            hide_index=True,
+            column_config={
+                "Precio": st.column_config.NumberColumn(format="%.4f"),
+                "RSI": st.column_config.NumberColumn(format="%.1f"),
+                "Stoch RSI": st.column_config.NumberColumn(format="%.1f"),
+                "Libro compra %": st.column_config.NumberColumn(format="%.1f"),
+                "Volumen x": st.column_config.NumberColumn(format="%.2f"),
+                "Puntuación": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
+            },
+        )
     else:
         st.info("El radar estará disponible después del primer ciclo automático.")
 
-    st.caption(f"Último escaneo UTC: {state.get('last_scan') or 'pendiente'}")
+    st.caption(
+        f"Último escaneo: {local_time(state.get('last_scan'))} (hora de Madrid) · "
+        f"UTC: {state.get('last_scan') or 'pendiente'}"
+    )
     st.write(f"**Comentario del motor:** {state.get('last_comment', '-')}")
     if state.get("last_error"):
         st.warning(f"Incidencias de mercado: {state['last_error']}")
@@ -165,7 +215,13 @@ def dashboard():
     st.subheader("Registro reciente")
     trades = state.get("trades", [])
     if trades:
-        st.table(trades[:50])
+        shown = pd.DataFrame(trades[:50])
+        if "candle_time" in shown:
+            shown["candle_time"] = pd.to_datetime(shown["candle_time"], unit="ms", utc=True, errors="coerce") \
+                .dt.tz_convert(LOCAL_TZ).dt.strftime("%d/%m %H:%M")
+        if "time" in shown:
+            shown["time"] = shown["time"].map(local_time)
+        st.dataframe(shown, hide_index=True)
         output = io.StringIO()
         fields = ["time", "symbol", "side", "price", "quantity", "pnl", "reason", "candle_time"]
         writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")

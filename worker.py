@@ -2,6 +2,7 @@
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import ccxt
@@ -37,6 +38,20 @@ def save_state(state):
             os.remove(temporary)
 
 
+def load_markets_with_retries(exchange, attempts=3, pause_seconds=5):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            exchange.load_markets()
+            return
+        except Exception as exc:  # errores de red o límites temporales del exchange
+            last_error = exc
+            print(f"Intento {attempt}/{attempts} de cargar mercados falló: {type(exc).__name__}: {str(exc)[:120]}")
+            if attempt < attempts:
+                time.sleep(pause_seconds)
+    raise last_error
+
+
 def main():
     state = load_state()
 
@@ -54,7 +69,18 @@ def main():
         "timeout": 20000,
         "options": {"defaultType": "spot"},
     })
-    exchange.load_markets()
+    try:
+        load_markets_with_retries(exchange)
+    except Exception as exc:
+        # Latido: se guarda igualmente que el motor se ejecutó, para que el panel distinga
+        # "el exchange falla" de "GitHub no ha lanzado el motor". El estado de la cuenta no cambia.
+        message = f"{exchange_id}: no se pudieron cargar los mercados ({type(exc).__name__}: {str(exc)[:120]})"
+        print(f"::warning::{message}")
+        state["worker_last_run"] = utc_now()
+        state["worker_exchange"] = exchange_id.upper()
+        state["last_error"] = message
+        save_state(state)
+        return
     available = [symbol for symbol in PAIRS if symbol in exchange.markets]
     if not available:
         raise RuntimeError(f"{exchange_id} no ofrece ninguno de los pares configurados.")

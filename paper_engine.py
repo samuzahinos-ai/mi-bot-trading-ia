@@ -1,7 +1,5 @@
 """Motor independiente de paper trading. No contiene interfaz web ni claves privadas."""
-import json
-import math
-import os
+import sys
 from datetime import datetime, timezone
 
 # ----------------------------- CONFIGURACIÓN -----------------------------
@@ -101,14 +99,37 @@ def rolling_vwap(candles, period=50):
 
 
 def order_book_pressure(exchange, symbol):
+    """Porcentaje del valor del libro (15 niveles) que está en compras.
+
+    Algunos exchanges (Kraken) devuelven niveles de 3 valores [precio, cantidad, marca de tiempo],
+    por eso se leen solo las dos primeras posiciones en lugar de desempaquetar.
+    """
     try:
         book = exchange.fetch_order_book(symbol, limit=15)
-        bid_value = sum(price * amount for price, amount in book.get("bids", [])[:15])
-        ask_value = sum(price * amount for price, amount in book.get("asks", [])[:15])
+        bid_value = sum(float(level[0]) * float(level[1]) for level in book.get("bids", [])[:15])
+        ask_value = sum(float(level[0]) * float(level[1]) for level in book.get("asks", [])[:15])
         total = bid_value + ask_value
         return 100.0 * bid_value / total if total > 0 else 50.0
-    except Exception:
+    except Exception as exc:
+        print(f"Aviso: libro de órdenes no disponible para {symbol}: {type(exc).__name__}: {str(exc)[:120]}",
+              file=sys.stderr)
         return 50.0
+
+
+def volume_ratio_value(volumes, recent=5, baseline=60):
+    """Volumen medio de las últimas velas frente al de las 60 anteriores.
+
+    Una sola vela de 1 minuto suele tener volumen cero en pares poco líquidos, lo que hacía
+    que este indicador valiera 0 casi siempre; promediar unas pocas velas lo estabiliza.
+    """
+    recent_values = volumes[-recent:]
+    base_values = volumes[-(recent + baseline):-recent]
+    if not recent_values or not base_values:
+        return 1.0
+    base_average = sum(base_values) / len(base_values)
+    if base_average <= 0:
+        return 1.0
+    return (sum(recent_values) / len(recent_values)) / base_average
 
 
 def evaluate_pair(exchange, symbol, candles):
@@ -131,8 +152,7 @@ def evaluate_pair(exchange, symbol, candles):
     atr = atr_value(candles, 14)
     vwap = rolling_vwap(candles, 50)
     pressure = order_book_pressure(exchange, symbol)
-    average_volume = sum(volumes[-21:-1]) / 20.0
-    volume_ratio = volumes[-1] / average_volume if average_volume > 0 else 1.0
+    volume_ratio = volume_ratio_value(volumes)
 
     if price > ema50 > ema200:
         regime = "ALCISTA"
