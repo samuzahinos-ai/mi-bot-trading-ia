@@ -6,7 +6,9 @@ from paper_engine import (
     ema_series,
     evaluate_pair,
     manage_position_with_history,
+    order_book_pressure,
     rsi_series,
+    volume_ratio_value,
 )
 
 
@@ -95,6 +97,35 @@ class PaperEngineTests(unittest.TestCase):
         self.assertAlmostEqual(state["realized_pnl"], 97.9, places=6)
         self.assertEqual(state["wins"], 1)
         self.assertIsNone(state["position"])
+
+    def test_order_book_pressure_accepts_three_value_levels(self):
+        # Kraken devuelve [precio, cantidad, marca_de_tiempo]; antes esto fallaba en silencio y daba 50.
+        class KrakenLikeExchange:
+            def fetch_order_book(self, symbol, limit=15):
+                return {
+                    "bids": [[100.0, 30.0, 1700000000], [99.0, 10.0, 1700000001]],
+                    "asks": [[101.0, 10.0, 1700000000], [102.0, 10.0, 1700000001]],
+                }
+
+        pressure = order_book_pressure(KrakenLikeExchange(), "BTC/USDT")
+        self.assertGreater(pressure, 55.0)
+        self.assertLess(pressure, 100.0)
+
+    def test_order_book_pressure_falls_back_to_neutral_on_error(self):
+        class BrokenExchange:
+            def fetch_order_book(self, symbol, limit=15):
+                raise RuntimeError("sin conexión")
+
+        self.assertEqual(order_book_pressure(BrokenExchange(), "BTC/USDT"), 50.0)
+
+    def test_volume_ratio_is_not_zero_when_last_candle_has_no_volume(self):
+        volumes = [100.0] * 60 + [100.0, 100.0, 100.0, 100.0, 0.0]
+        ratio = volume_ratio_value(volumes)
+        self.assertAlmostEqual(ratio, 0.8, places=6)
+
+    def test_volume_ratio_defaults_to_neutral_without_history(self):
+        self.assertEqual(volume_ratio_value([1.0, 2.0]), 1.0)
+        self.assertEqual(volume_ratio_value([0.0] * 80), 1.0)
 
 
 if __name__ == "__main__":
