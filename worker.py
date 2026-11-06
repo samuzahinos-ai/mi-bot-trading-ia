@@ -7,21 +7,58 @@ from pathlib import Path
 
 import ccxt
 
-from paper_engine import PAIRS, default_state, run_cycle, utc_now
+from paper_engine import (
+    PAIRS,
+    STRATEGY_VERSION,
+    default_state,
+    ensure_sleeves,
+    open_positions,
+    portfolio_equity,
+    run_cycle,
+    utc_now,
+)
 
 STATE_PATH = Path("paper_state.json")
 ALLOWED_EXCHANGES = {"kraken", "binance", "bybit", "coinbase"}
+
+
+def summarize_legacy(old):
+    """Resume una cuenta de la estrategia anterior (v1) para mostrarla en el panel sin mezclarla con la nueva."""
+    cash = float(old.get("cash", 0.0))
+    position = old.get("position")
+    if position:
+        cash += float(position.get("quantity", 0.0)) * float(position.get("last_price", position.get("entry_price", 0.0)))
+    initial = float(old.get("initial_balance", 1000.0))
+    wins, losses = int(old.get("wins", 0)), int(old.get("losses", 0))
+    return {
+        "strategy": "v1: scalping en velas de 1 minuto",
+        "equity": round(cash, 2),
+        "initial_balance": initial,
+        "return_pct": round(100.0 * (cash - initial) / initial, 2) if initial else 0.0,
+        "wins": wins,
+        "losses": losses,
+        "max_drawdown_pct": round(float(old.get("max_drawdown_pct", 0.0)), 2),
+        "retired_at": utc_now(),
+    }
 
 
 def load_state():
     if not STATE_PATH.exists():
         return default_state()
     try:
-        state = default_state()
-        state.update(json.loads(STATE_PATH.read_text(encoding="utf-8")))
-        return state
+        loaded = json.loads(STATE_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"No se pudo leer paper_state.json: {exc}") from exc
+    if loaded.get("version") != STRATEGY_VERSION:
+        # Estado de otra estrategia: se archiva un resumen y se empieza una cuenta nueva y limpia.
+        state = default_state()
+        state["legacy_v1"] = summarize_legacy(loaded)
+        state["bot_enabled"] = bool(loaded.get("bot_enabled", True))
+        print(f"Estado v{loaded.get('version', 1)} archivado; nueva cuenta v{STRATEGY_VERSION} de 1000 USDT.")
+        return state
+    state = default_state()
+    state.update(loaded)
+    return ensure_sleeves(state)
 
 
 def save_state(state):
@@ -91,7 +128,11 @@ def main():
     state["worker_last_run"] = utc_now()
     state["worker_exchange"] = exchange_id.upper()
     save_state(state)
-    print(f"Ciclo completado. Último escaneo: {state.get('last_scan')}; efectivo: {state['cash']:.2f} USDT")
+    print(
+        f"Ciclo completado. Último escaneo: {state.get('last_scan')}; patrimonio: {portfolio_equity(state):.2f} USDT; "
+        f"posiciones abiertas: {len(open_positions(state))}"
+    )
+    print(f"Comentario: {state.get('last_comment')}")
     if state.get("last_error"):
         print(f"Advertencias: {state['last_error']}")
 

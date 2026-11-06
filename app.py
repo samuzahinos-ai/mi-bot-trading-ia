@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
+from paper_engine import FEE_RATE, LOOKBACKS, PAIRS, SLIPPAGE_RATE, STRATEGY_VERSION, default_state, portfolio_equity, total_cash
+
 try:
     from google import genai
 except Exception:
@@ -23,26 +25,7 @@ REPO = "mi-bot-trading-ia"
 STATE_URL = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/bot-state/paper_state.json"
 WORKFLOW_URL = f"https://github.com/{OWNER}/{REPO}/actions/workflows/paper-bot.yml"
 MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
-
-
-def default_state():
-    return {
-        "cash": 1000.0,
-        "initial_balance": 1000.0,
-        "position": None,
-        "trades": [],
-        "realized_pnl": 0.0,
-        "wins": 0,
-        "losses": 0,
-        "peak_equity": 1000.0,
-        "max_drawdown_pct": 0.0,
-        "last_scan": None,
-        "worker_last_run": None,
-        "last_error": None,
-        "last_comment": "Esperando la primera ejecución automática.",
-        "radar": {},
-        "bot_enabled": True,
-    }
+LOCAL_TZ = ZoneInfo("Europe/Madrid")
 
 
 def fetch_state():
@@ -50,9 +33,15 @@ def fetch_state():
     request = urllib.request.Request(url, headers={"Cache-Control": "no-cache", "User-Agent": "paper-trading-dashboard"})
     try:
         with urllib.request.urlopen(request, timeout=12) as response:
+            loaded = json.loads(response.read().decode("utf-8"))
+        if loaded.get("version") != STRATEGY_VERSION:
+            # La rama aún contiene el estado de la estrategia anterior: se espera al primer ciclo nuevo.
             state = default_state()
-            state.update(json.loads(response.read().decode("utf-8")))
-            return state, None
+            state["worker_last_run"] = loaded.get("worker_last_run")
+            return state, "Esperando el primer ciclo de la estrategia v2 (el motor aún no ha migrado el estado)."
+        state = default_state()
+        state.update(loaded)
+        return state, None
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return default_state(), "El motor aún no ha guardado su primera lectura. Ejecuta el flujo de GitHub Actions."
@@ -61,22 +50,19 @@ def fetch_state():
         return default_state(), f"No se pudo leer el estado remoto: {str(exc)[:180]}"
 
 
-LOCAL_TZ = ZoneInfo("Europe/Madrid")
-
-
 def parse_utc(timestamp):
     if not timestamp:
         return None
     try:
-        return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        return datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
     except Exception:
         return None
 
 
-def local_time(timestamp):
+def local_time(timestamp, fmt="%d/%m/%Y %H:%M:%S"):
     """Convierte un instante ISO en UTC a la hora de Madrid para mostrarlo."""
     dt = parse_utc(timestamp)
-    return dt.astimezone(LOCAL_TZ).strftime("%d/%m/%Y %H:%M:%S") if dt else "pendiente"
+    return dt.astimezone(LOCAL_TZ).strftime(fmt) if dt else "pendiente"
 
 
 def human_age(minutes):
@@ -87,17 +73,17 @@ def human_age(minutes):
 
 
 def age_minutes(timestamp):
-    if not timestamp:
+    dt = parse_utc(timestamp)
+    if not dt:
         return None
-    try:
-        dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-        return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 60.0)
-    except Exception:
-        return None
+    return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 60.0)
 
 
 st.title("📊 Bot de trading con simulación")
-st.caption("Motor programado en GitHub Actions · Datos públicos de Kraken · Solo dinero ficticio · Sin órdenes reales")
+st.caption(
+    "Estrategia v2: seguimiento de tendencia en velas de 4 h · Motor programado en GitHub Actions · "
+    "Datos públicos de Kraken · Solo dinero ficticio · Sin órdenes reales"
+)
 
 with st.sidebar:
     st.header("Control remoto")
@@ -105,24 +91,23 @@ with st.sidebar:
     st.caption(
         "En GitHub: Actions → Bot paper trading cada 5 minutos → Run workflow. "
         "Marca o desmarca allow_entries y pulsa Run workflow. "
-        "Aunque desactives nuevas entradas, el motor seguirá gestionando una posición abierta."
+        "Aunque desactives nuevas entradas, el motor seguirá gestionando las posiciones abiertas."
     )
     st.divider()
     st.write("**Supuestos del simulador**")
-    st.write("Comisión: 0,10 % por lado")
-    st.write("Deslizamiento: 0,05 % por lado")
-    st.write("Riesgo teórico: 1 % por operación")
-    st.write("Máxima asignación: 25 % del efectivo")
-    st.write("Pérdida diaria máxima: 3 %")
+    st.write(f"Comisión: {FEE_RATE * 100:.2f} % por lado (nivel inicial de Kraken)".replace(".", ","))
+    st.write(f"Deslizamiento: {SLIPPAGE_RATE * 100:.2f} % por lado".replace(".", ","))
+    st.write(f"Capital repartido en {len(PAIRS) * len(LOOKBACKS)} huchas ({len(PAIRS)} pares × {len(LOOKBACKS)} ventanas)")
+    st.write("Riesgo por operación: 5 % de su hucha")
+    st.write("Stop de seguridad: 4 × ATR")
     st.divider()
-    st.caption("El motor se ejecuta cada 5 minutos si el disparador externo está configurado (ver LEEME_24-7.md). "
+    st.caption("El motor decide con velas de 4 h y se ejecuta cada 5 minutos para vigilar stops y salidas. "
                "El panel puede dormir sin detener el motor.")
 
 
 @st.fragment(run_every="60s")
 def dashboard():
     state, read_warning = fetch_state()
-
     if read_warning:
         st.warning(read_warning)
 
@@ -145,61 +130,85 @@ def dashboard():
     else:
         st.warning(f"Motor en pausa de nuevas entradas · última ejecución hace {age:.1f} minutos. Gestiona posiciones abiertas.")
 
-    position = state.get("position")
-    prices = {symbol: item["price"] for symbol, item in state.get("radar", {}).items()}
-    if position:
-        mark = prices.get(position["symbol"], position.get("last_price", position["entry_price"]))
-        equity = state["cash"] + position["quantity"] * mark * (1.0 - 0.001)
-    else:
-        equity = state["cash"]
+    legacy = state.get("legacy_v1")
+    if legacy:
+        st.info(
+            f"Cuenta reiniciada con la estrategia v2. La estrategia anterior (scalping a 1 minuto) terminó con "
+            f"{legacy['equity']:,.2f} USDT ({legacy['return_pct']:+.2f} %), {legacy['wins']} ganadas / "
+            f"{legacy['losses']} perdidas: el coste de cada operación superaba el movimiento medio del precio."
+        )
+
+    radar = state.get("radar", {})
+    prices = {symbol: item["price"] for symbol, item in radar.items()}
+    equity = portfolio_equity(state, prices)
     initial = float(state.get("initial_balance", 1000.0))
-    pnl = equity - initial
-    pnl_pct = 100.0 * pnl / initial if initial else 0.0
+    pnl_pct = 100.0 * (equity - initial) / initial if initial else 0.0
     total_closed = int(state.get("wins", 0)) + int(state.get("losses", 0))
-    win_rate = 100.0 * state["wins"] / total_closed if total_closed else None
+    positions = [
+        (sleeve, sleeve["position"]) for sleeve in state["sleeves"].values() if sleeve.get("position")
+    ]
 
     cols = st.columns(4)
     cols[0].metric("Patrimonio estimado", f"{equity:,.2f} USDT", f"{pnl_pct:+.2f} %")
-    cols[1].metric("Efectivo libre", f"{state['cash']:,.2f} USDT")
-    cols[2].metric("Operaciones cerradas", str(total_closed), f"{state['wins']} ganadas / {state['losses']} perdidas")
+    cols[1].metric("Efectivo libre", f"{total_cash(state):,.2f} USDT")
+    cols[2].metric("Operaciones cerradas", str(total_closed), f"{state.get('wins', 0)} ganadas / {state.get('losses', 0)} perdidas", delta_color="off")
     cols[3].metric("Drawdown máximo", f"{state.get('max_drawdown_pct', 0.0):.2f} %")
 
-    if position:
-        st.subheader(f"Posición simulada abierta: {position['symbol']}")
-        pcols = st.columns(4)
-        pcols[0].metric("Precio de entrada", f"{position['entry_price']:.6f}")
-        pcols[1].metric("Cantidad", f"{position['quantity']:.8f}")
-        pcols[2].metric("Stop loss", f"{position['stop_loss']:.6f}")
-        pcols[3].metric("Take profit", f"{position['take_profit']:.6f}")
+    history = state.get("equity_history", [])
+    if len(history) >= 2:
+        frame = pd.DataFrame(history, columns=["Fecha", "Patrimonio (USDT)"])
+        frame["Fecha"] = pd.to_datetime(frame["Fecha"], utc=True, errors="coerce").dt.tz_convert(LOCAL_TZ)
+        st.line_chart(frame.dropna().set_index("Fecha"), height=220)
+
+    st.subheader(f"Posiciones abiertas ({len(positions)})" if positions else "Sin posiciones abiertas")
+    if positions:
+        rows = []
+        for sleeve, pos in positions:
+            mark = prices.get(pos["symbol"], pos.get("last_price", pos["entry_price"]))
+            rows.append({
+                "Activo": pos["symbol"],
+                "Ventana": sleeve["lookback"],
+                "Entrada": pos["entry_price"],
+                "Precio actual": mark,
+                "Resultado %": 100.0 * (mark / pos["entry_price"] - 1.0),
+                "Stop de seguridad": pos["stop"],
+                "Abierta (Madrid)": local_time(pos.get("entry_time"), "%d/%m %H:%M"),
+            })
+        st.dataframe(
+            pd.DataFrame(rows), hide_index=True, width="stretch",
+            column_config={
+                "Entrada": st.column_config.NumberColumn(format="%.6g"),
+                "Precio actual": st.column_config.NumberColumn(format="%.6g"),
+                "Stop de seguridad": st.column_config.NumberColumn(format="%.6g"),
+                "Resultado %": st.column_config.NumberColumn(format="%+.2f"),
+            },
+        )
     else:
-        st.subheader("Sin posición abierta")
+        st.caption("Es normal pasar días sin posiciones: el bot solo compra cuando un cierre de 4 h rompe un máximo de 60 a 240 velas.")
 
     st.subheader("Radar de mercado")
-    radar_rows = []
-    for symbol, item in state.get("radar", {}).items():
-        radar_rows.append({
-            "Activo": symbol,
-            "Precio": item["price"],
-            "Tendencia": item["regime"],
-            "RSI": item["rsi"],
-            "Stoch RSI": item["stoch_rsi"],
-            "Libro compra %": item["buy_pressure"],
-            "Volumen x": item["volume_ratio"],
-            "Puntuación": item["score"],
-            "Motivos": item["reasons"],
-        })
+    radar_rows = [{
+        "Activo": symbol,
+        "Precio": item["price"],
+        "Estado": item["status"],
+        "Posición en el canal %": item["channel_pos"],
+        "Distancia a ruptura %": item["dist_breakout"],
+        "Volatilidad ATR %": item["atr_pct"],
+    } for symbol, item in radar.items()]
     if radar_rows:
         st.dataframe(
-            pd.DataFrame(radar_rows),
-            hide_index=True,
+            pd.DataFrame(radar_rows), hide_index=True, width="stretch",
             column_config={
-                "Precio": st.column_config.NumberColumn(format="%.4f"),
-                "RSI": st.column_config.NumberColumn(format="%.1f"),
-                "Stoch RSI": st.column_config.NumberColumn(format="%.1f"),
-                "Libro compra %": st.column_config.NumberColumn(format="%.1f"),
-                "Volumen x": st.column_config.NumberColumn(format="%.2f"),
-                "Puntuación": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%d"),
+                "Precio": st.column_config.NumberColumn(format="%.6g"),
+                "Posición en el canal %": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.0f"),
+                "Distancia a ruptura %": st.column_config.NumberColumn(format="%.2f"),
+                "Volatilidad ATR %": st.column_config.NumberColumn(format="%.2f"),
             },
+        )
+        st.caption(
+            "Posición en el canal: dónde está el precio entre el mínimo y el máximo de las últimas 240 velas de 4 h (≈40 días). "
+            "Distancia a ruptura: cuánto debe subir para superar el máximo de 60 velas (≈10 días); "
+            "la compra exige un cierre de 4 h por encima, no un simple toque."
         )
     else:
         st.info("El radar estará disponible después del primer ciclo automático.")
@@ -221,9 +230,9 @@ def dashboard():
                 .dt.tz_convert(LOCAL_TZ).dt.strftime("%d/%m %H:%M")
         if "time" in shown:
             shown["time"] = shown["time"].map(local_time)
-        st.dataframe(shown, hide_index=True)
+        st.dataframe(shown, hide_index=True, width="stretch")
         output = io.StringIO()
-        fields = ["time", "symbol", "side", "price", "quantity", "pnl", "reason", "candle_time"]
+        fields = ["time", "symbol", "side", "lookback", "price", "quantity", "pnl", "return_pct", "reason", "candle_time"]
         writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(trades)
@@ -236,20 +245,48 @@ def dashboard():
     else:
         st.caption("Todavía no hay operaciones guardadas.")
 
-    st.caption(
-        f"Win rate: {win_rate:.1f} %" if win_rate is not None else "Win rate: sin operaciones cerradas"
-    )
-    if state.get("losses", 0):
-        gain_amount = sum(t["pnl"] for t in trades if t.get("pnl") is not None and t["pnl"] > 0)
-        loss_amount = sum(abs(t["pnl"]) for t in trades if t.get("pnl") is not None and t["pnl"] < 0)
-        st.caption(f"Profit factor reciente: {gain_amount / loss_amount:.2f}" if loss_amount else "Profit factor: no disponible.")
-    elif any(t.get("pnl", 0) and t["pnl"] > 0 for t in trades):
+    gross_profit, gross_loss = float(state.get("gross_profit", 0.0)), float(state.get("gross_loss", 0.0))
+    if total_closed:
+        st.caption(f"Win rate: {100.0 * state['wins'] / total_closed:.1f} % · Resultado realizado: {state.get('realized_pnl', 0.0):+.2f} USDT")
+    else:
+        st.caption("Win rate: sin operaciones cerradas")
+    if gross_loss > 0:
+        st.caption(f"Profit factor: {gross_profit / gross_loss:.2f}")
+    elif gross_profit > 0:
         st.caption("Profit factor: infinito (todavía no hay operaciones perdedoras cerradas).")
     else:
         st.caption("Profit factor: no disponible todavía.")
 
 
 dashboard()
+
+with st.expander("¿Cómo decide el bot y qué cabe esperar?"):
+    st.markdown(
+        """
+**Qué hace.** Cada 4 horas se cierra una vela. Si el cierre supera el máximo de las últimas 60, 90, 120, 180 o 240 velas
+(10 a 40 días), el bot compra en esa «ventana». Vende cuando una vela cierra por debajo del mínimo de la mitad de esas velas,
+o si el precio cae 4 ATR bajo la entrada (stop de seguridad). Son 25 huchas independientes: 5 pares × 5 ventanas.
+
+**Por qué no opera cada minuto.** Con comisiones de Kraken (0,40 % por lado en el nivel inicial) cada ida y vuelta cuesta
+más de un 1 %. Una estrategia necesita ganancias medias claramente mayores que eso, y solo los movimientos de varios días las dan.
+
+**Qué cabe esperar (simulación histórica con datos de Binance 2018–2026, comisión 0,40 % + 0,05 %, no es una promesa):**
+
+| | Estrategia | Comprar y mantener los 5 pares |
+|---|---|---|
+| 2023–oct 2026, rentabilidad anual | ≈ 20 % | ≈ 46 % |
+| 2023–oct 2026, peor caída | ≈ −31 % | ≈ −70 % |
+| 2022 (mercado bajista) | ≈ −10 % | ≈ −69 % |
+| 2025 | ≈ −4 % | ≈ −26 % |
+
+- **Gana menos en mercados alcistas fuertes** y protege mucho más en los bajistas.
+- **Pierde más operaciones de las que gana** (se ganan entre el 36 % y el 38 %) y encadena rachas de hasta 21 pérdidas seguidas.
+  Los beneficios vienen de pocas operaciones grandes.
+- **Puede pasar años por debajo de su máximo**: en la simulación, hasta 1.031 días sin nuevo máximo de patrimonio.
+- Con comisión de 0,80 % (órdenes a mercado) la rentabilidad anual fuera de muestra baja a ≈ 16 %.
+- Los datos son de Binance y los pares de Kraken en USDT tienen menos liquidez; en la práctica habrá diferencias.
+        """
+    )
 
 st.divider()
 st.subheader("Análisis descriptivo opcional con Gemini")
@@ -275,17 +312,17 @@ if st.button("Analizar el radar con Gemini"):
                 {
                     "activo": key,
                     "precio": value["price"],
-                    "tendencia": value["regime"],
-                    "rsi": value["rsi"],
-                    "score": value["score"],
-                    "razones": value["reasons"],
+                    "estado": value["status"],
+                    "posicion_en_canal_pct": value["channel_pos"],
+                    "distancia_a_ruptura_pct": value["dist_breakout"],
+                    "volatilidad_atr_pct": value["atr_pct"],
                 }
                 for key, value in state_for_ai["radar"].items()
             ]
             prompt = (
-                "Resume en español este radar de mercado con fines educativos. "
-                "Señala riesgos e incertidumbres. No des órdenes de compra o venta ni prometas rentabilidad. "
-                "Aclara que la puntuación heurística no es una probabilidad de éxito. Datos: "
+                "Resume en español este radar de mercado con fines educativos. La estrategia compra cuando una vela de 4 horas "
+                "cierra por encima del máximo de las últimas 60 a 240 velas. "
+                "Señala riesgos e incertidumbres. No des órdenes de compra o venta ni prometas rentabilidad. Datos: "
                 + json.dumps(compact, ensure_ascii=False)
             )
             response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
@@ -297,6 +334,6 @@ st.divider()
 st.warning(
     "La automatización corre por intervalos de GitHub Actions, no como un proceso continuo. "
     "Puede retrasarse o perder ejecuciones. Las comisiones, el deslizamiento y los precios de simulación "
-    "son aproximaciones; no demuestran ventaja estadística ni garantizan resultados. "
+    "son aproximaciones; los resultados históricos no garantizan resultados futuros. "
     "Esta aplicación no envía órdenes al exchange."
 )
