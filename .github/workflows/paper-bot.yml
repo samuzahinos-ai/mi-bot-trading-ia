@@ -85,6 +85,9 @@ jobs:
       - name: Ejecutar un ciclo de simulación
         env:
           EXCHANGE_ID: kraken
+          # Costes de la simulación (por lado). Kraken nivel inicial: 0,40 % maker / 0,80 % taker.
+          FEE_RATE: "0.0040"
+          SLIPPAGE_RATE: "0.0005"
           # Solo una ejecución manual puede cambiar el interruptor persistente de nuevas entradas.
           SET_BOT_ENABLED: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
           BOT_ENABLED_INPUT: ${{ inputs.allow_entries }}

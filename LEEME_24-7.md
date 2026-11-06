@@ -54,7 +54,6 @@ recibirla (`repository_dispatch` con el tipo `tick`). El calendario de GitHub qu
   escribir en este repositorio público, así que si sospechas que se ha filtrado, revócalo en GitHub.
 - **Pausar nuevas entradas:** sigue haciéndose desde Actions → *Run workflow* → `allow_entries`.
   Las señales automáticas (`tick`) nunca cambian ese interruptor.
-- **Huecos:** aunque falte alguna ejecución, el motor revisa todas las velas cerradas de 1 minuto
-  transcurridas (hasta ~11 horas), así que los stops y objetivos no se pierden.
+- **Huecos:** aunque falte alguna ejecución, el motor revisa todas las velas cerradas de 4 horas desde cada entrada, así que stops y salidas no se pierden.
 - **Si prefieres no depender de GitHub:** el motor es un único `python worker.py`; puede ejecutarse
   en cualquier servidor pequeño (por ejemplo una máquina gratuita en la nube) con un cron cada 5 min.

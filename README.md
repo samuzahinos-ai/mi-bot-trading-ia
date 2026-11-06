@@ -11,18 +11,22 @@ Esta aplicación utiliza datos públicos de Kraken y simula operaciones con sald
 
 GitHub indica que el uso de ejecutores estándar alojados por GitHub es gratuito en repositorios públicos. El calendario tiene un intervalo mínimo de 5 minutos; las ejecuciones programadas pueden retrasarse o perderse durante periodos de carga y se desactivan automáticamente si el repositorio público permanece 60 días sin actividad. Por eso es una automatización gratuita por intervalos, **no un servicio de trading continuo con disponibilidad garantizada**.
 
-## Qué hace el motor
+## Qué hace el motor (estrategia v2)
 
-- Escanea BTC/USDT, ETH/USDT, SOL/USDT, XRP/USDT y DOGE/USDT, si están disponibles en Kraken.
-- Usa velas cerradas de 1 minuto.
-- Calcula EMA 50/200, RSI, Stoch RSI, MACD, ATR, VWAP móvil, volumen relativo y presión aproximada del libro de órdenes.
-- La puntuación es una regla heurística, **no una probabilidad de ganar**.
-- Simula comisiones y deslizamiento en compra y venta.
-- Dimensiona posiciones con riesgo teórico del 1 % y limita la asignación al 25 % del efectivo.
-- Bloquea nuevas entradas al alcanzar el límite diario de pérdida del 3 %.
-- Revisa todas las velas cerradas transcurridas entre ciclos para comprobar stops y objetivos.
-- Permite pausar nuevas entradas sin detener la gestión de una posición abierta.
+- Opera **seguimiento de tendencia en velas de 4 horas** sobre BTC, ETH, SOL, XRP y DOGE (contra USDT), solo en largo.
+- Compra cuando una vela de 4 h **cierra por encima del máximo de las últimas 60, 90, 120, 180 o 240 velas** (10 a 40 días). Cada ventana
+  es una «hucha» independiente: 5 pares × 5 ventanas = 25 huchas de 40 USDT.
+- Vende cuando una vela cierra por debajo del mínimo de la mitad de esas velas, o si el precio cae **4 ATR** bajo la entrada (stop de seguridad).
+- Arriesga como máximo el 5 % de cada hucha hasta el stop.
+- Simula comisión de 0,40 % por lado (nivel inicial de Kraken) y 0,05 % de deslizamiento. Se pueden cambiar con `FEE_RATE` y `SLIPPAGE_RATE`.
+- Se ejecuta cada 5 minutos para vigilar stops y salidas, aunque solo decide compras con velas cerradas de 4 h.
+- Si GitHub se salta ejecuciones, al volver revisa todas las velas cerradas desde la entrada: no se pierden stops ni salidas.
+- Permite pausar nuevas entradas sin detener la gestión de las posiciones abiertas.
 - Gemini es opcional y solo genera comentarios descriptivos desde el panel; no controla el motor ni autoriza operaciones.
+
+**Por qué esta estrategia:** la v1 (scalping a 1 minuto) perdió las 49 operaciones porque cada una costaba más que el movimiento que buscaba.
+La validación de la v2 con 9 años de datos, con sus resultados y sus límites, está en [INFORME_BACKTEST.md](INFORME_BACKTEST.md).
+Lo esencial: es normal ganar menos de la mitad de las operaciones, pasar días sin operar y tener rachas largas por debajo del máximo.
 
 ## Primer arranque
 
@@ -65,7 +69,7 @@ No escribas claves en `app.py`, en GitHub ni en mensajes. Gemini no es necesario
 
 ## Estado y privacidad
 
-La rama pública `bot-state` contiene saldo simulado, operaciones, métricas y lecturas de mercado. No contiene claves ni credenciales. El estado de la anterior base de datos local de Streamlit no se migra automáticamente: el nuevo motor comienza con una cuenta ficticia independiente de 1.000 USDT.
+La rama pública `bot-state` contiene saldo simulado, operaciones, métricas y lecturas de mercado. No contiene claves ni credenciales. Al pasar de la v1 a la v2 el motor archiva un resumen de la cuenta anterior y empieza una cuenta ficticia nueva de 1.000 USDT.
 
 ## Límites
 
@@ -74,5 +78,5 @@ La rama pública `bot-state` contiene saldo simulado, operaciones, métricas y l
 - GitHub puede retrasar u omitir ejecuciones programadas y puede desactivar el calendario tras 60 días sin actividad del repositorio.
 - Streamlit Community Cloud suspende el panel tras 12 horas sin tráfico, pero eso no detiene GitHub Actions.
 - Comisión, deslizamiento, liquidez y ejecución son supuestos simplificados.
-- No hay backtesting riguroso ni evidencia de ventaja estadística. Hace falta evaluación fuera de muestra y observación prolongada en papel.
+- El backtest (ver informe) usa datos de Binance, no incluye todos los costes reales y su selección no fue totalmente ciega: hace falta observación prolongada en papel antes de confiar en ella.
 - No añadas claves de API de trading ni permisos de retirada.
